@@ -1,0 +1,15 @@
+name: Latest Codex Schema Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 8 * * 1'
+
+jobs:
+  audit:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install --global @openai/codex@latest
+      - name: Compare latest CLI to reviewed snapshot
+        run: Scripts/check-schema-drift.sh

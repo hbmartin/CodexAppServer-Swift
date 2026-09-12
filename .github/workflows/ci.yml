@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['0.2.*']
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build with strict concurrency
+        run: swift build -Xswiftc -strict-concurrency=complete
+      - name: Test
+        run: swift test -Xswiftc -strict-concurrency=complete
+      - name: Build documentation
+        run: |
+          xcodebuild docbuild -scheme CodexAppServerKit -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+          xcodebuild docbuild -scheme CodexAppServerHost -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+          xcodebuild docbuild -scheme CodexAppServerObservation -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+          xcodebuild docbuild -scheme CodexAppServerRemoteExperimental -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+      - name: Check 0.2.x API compatibility
+        if: github.event_name == 'pull_request'
+        run: |
+          tag=$(git tag --list '0.2.*' --sort=-v:refname | head -n 1)
+          if [[ -n "$tag" ]]; then swift package diagnose-api-breaking-changes "$tag"; fi
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS SDK products
+        run: >-
+          xcodebuild build
+          -scheme CodexAppServerKit
+          -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO
+          SWIFT_STRICT_CONCURRENCY=complete
+      - name: Test iOS simulator adapters
+        run: >-
+          xcodebuild test
+          -scheme CodexAppServerSDK-Package
+          -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+          CODE_SIGNING_ALLOWED=NO
+          SWIFT_STRICT_CONCURRENCY=complete
+
+  schema:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install reviewed schema generator
+        run: npm install --global @openai/codex@0.146.0
+      - name: Reject schema drift
+        run: Scripts/check-schema-drift.sh
+
+  authenticated-release:
+    if: startsWith(github.ref, 'refs/tags/0.2.')
+    runs-on: macos-15
+    env:
+      CODEX_LUNA_MODEL: gpt-5.6-luna
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install --global @openai/codex@0.146.0
+      - name: Authenticated Luna-only suite
+        run: Scripts/run-authenticated-luna-tests.sh
