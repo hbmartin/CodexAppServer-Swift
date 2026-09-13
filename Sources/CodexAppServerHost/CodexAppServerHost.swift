@@ -1,6 +1,7 @@
 #if os(macOS)
 @preconcurrency import Foundation
 import Darwin
+import Network
 import CodexAppServerKit
 
 public struct CodexCLIVersion: Sendable, Comparable, CustomStringConvertible {
@@ -109,7 +110,7 @@ public enum CodexHostTransports {
     public static func sshForward(sshURL: URL = URL(fileURLWithPath: "/usr/bin/ssh"), host: CodexSSHHost, localPort: Int, remotePort: Int, remoteHost: String = "127.0.0.1", path: String = "/", bearer: (any CodexBearerCredentialProvider)? = nil) throws -> CodexTransportFactory {
         guard (1...65535).contains(localPort), (1...65535).contains(remotePort) else { throw CodexError.invalidConfiguration("SSH forwarding requires explicit valid local and remote ports") }
         let args = try CodexSSHArguments.build(host: host, remoteArguments: [])
-        let insertion = ["-N", "-L", "\(localPort):\(remoteHost):\(remotePort)"]
+        let insertion = ["-o", "ExitOnForwardFailure=yes", "-N", "-L", "127.0.0.1:\(localPort):\(remoteHost):\(remotePort)"]
         guard let marker = args.firstIndex(of: "--") else { throw CodexError.invalidConfiguration("Invalid SSH argument construction") }
         let tunnelArguments = Array(args[..<marker]) + insertion + Array(args[marker...])
         let url = URL(string: "ws://127.0.0.1:\(localPort)\(path.hasPrefix("/") ? path : "/" + path)")!
@@ -182,6 +183,8 @@ private actor ProcessJSONLTransport: CodexTransport {
     private let executableURL: URL, arguments: [String], environment: [String: String]
     private let maximumFrameBytes: Int
     private var process: Process?, input: FileHandle?, outputHandle: FileHandle?, errorHandle: FileHandle?, outputBuffer = Data(), stderrTail = Data(), closing = false
+    private var finished = false
+    private var shutdownTask: Task<Void, Never>?
     init(executableURL: URL, arguments: [String], environment: [String: String], maximumFrameBytes: Int) {
         self.executableURL = executableURL; self.arguments = arguments; self.environment = environment; self.maximumFrameBytes = maximumFrameBytes
         let frames = AsyncThrowingStream<Data, Error>.makeStream(); incomingFrames = frames.stream; frameContinuation = frames.continuation
@@ -202,18 +205,20 @@ private actor ProcessJSONLTransport: CodexTransport {
         var value = frame; value.append(0x0A); do { try input.write(contentsOf: value) } catch { throw CodexError.transportClosed(error.localizedDescription) }
     }
     func close() async {
-        guard !closing else { return }; closing = true; try? input?.close(); input = nil
-        if let process, process.isRunning { process.terminate(); try? await Task.sleep(for: .milliseconds(100)); if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) } }
+        closing = true
         finish(nil)
+        await shutdownTask?.value
+        process = nil
     }
     private func receiveStdout(_ data: Data) {
-        guard !data.isEmpty else { return }; outputBuffer.append(data)
+        guard !finished, !data.isEmpty else { return }; outputBuffer.append(data)
         if outputBuffer.count > maximumFrameBytes, !outputBuffer.contains(0x0A) { finish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)); return }
         while let newline = outputBuffer.firstIndex(of: 0x0A) {
             var frame = Data(outputBuffer[..<newline]); outputBuffer.removeSubrange(...newline); if frame.last == 0x0D { frame.removeLast() }
             if frame.count > maximumFrameBytes { finish(CodexError.frameTooLarge(actual: frame.count, limit: maximumFrameBytes)); return }
             if !frame.isEmpty { frameContinuation.yield(frame) }
         }
+        if outputBuffer.count > maximumFrameBytes { finish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)) }
     }
     private func receiveStderr(_ data: Data) { guard !data.isEmpty else { return }; stderrTail.append(data); if stderrTail.count > 65_536 { stderrTail.removeFirst(stderrTail.count - 65_536) }; diagnosticContinuation.yield(.init(level: .debug, message: String(decoding: data, as: UTF8.self))) }
     private func terminated(_ code: Int32) {
@@ -223,8 +228,13 @@ private actor ProcessJSONLTransport: CodexTransport {
         finish(closing || code == 0 ? nil : CodexError.transportClosed("process exited \(code): \(String(decoding: stderrTail, as: UTF8.self))"))
     }
     private func finish(_ error: Error?) {
-        guard process != nil else { return }; process = nil; try? input?.close(); input = nil
+        guard !finished else { return }; finished = true
+        try? input?.close(); input = nil
         outputHandle?.readabilityHandler = nil; errorHandle?.readabilityHandler = nil; outputHandle = nil; errorHandle = nil
+        outputBuffer.removeAll()
+        if let child = process {
+            shutdownTask = Task { await terminateOwnedProcess(child) }
+        }
         if let error { frameContinuation.finish(throwing: error) } else { frameContinuation.finish() }; diagnosticContinuation.finish()
     }
 }
@@ -235,21 +245,119 @@ private actor SSHForwardTransport: CodexTransport {
     private let frames: AsyncThrowingStream<Data, Error>.Continuation, diagnostic: AsyncStream<CodexTransportDiagnostic>.Continuation
     private let sshURL: URL, arguments: [String], webSocketConfiguration: CodexWebSocketConfiguration
     private var process: Process?, inner: (any CodexTransport)?, tasks: [Task<Void, Never>] = []
+    private var closing = false
+    private var errorHandle: FileHandle?
+    private var stderrTail = Data()
+    private var shutdownTask: Task<Void, Never>?
     init(sshURL: URL, arguments: [String], webSocketConfiguration: CodexWebSocketConfiguration) {
         self.sshURL = sshURL; self.arguments = arguments; self.webSocketConfiguration = webSocketConfiguration
         let f = AsyncThrowingStream<Data, Error>.makeStream(); incomingFrames = f.stream; frames = f.continuation
         let d = AsyncStream<CodexTransportDiagnostic>.makeStream(); diagnostics = d.stream; diagnostic = d.continuation
     }
     func start() async throws {
-        let child = Process(), errors = Pipe(); child.executableURL = sshURL; child.arguments = arguments; child.standardError = errors
-        do { try child.run() } catch { throw CodexError.transportClosed(error.localizedDescription) }; process = child
-        try await Task.sleep(for: .milliseconds(200))
-        guard child.isRunning else { throw CodexError.transportClosed(String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)) }
-        let transport = try await CodexWebSocketTransport.factory(configuration: webSocketConfiguration).makeTransport(); try await transport.start(); inner = transport
-        let incoming = transport.incomingFrames, diagnostics = transport.diagnostics
-        tasks = [Task { [weak self] in do { for try await frame in incoming { self?.frames.yield(frame) } } catch { self?.frames.finish(throwing: error) } }, Task { [weak self] in for await value in diagnostics { self?.diagnostic.yield(value) } }]
+        guard process == nil, !closing else { throw CodexError.alreadyConnected }
+        let child = Process(), errors = Pipe()
+        child.executableURL = sshURL; child.arguments = arguments; child.standardError = errors
+        child.standardInput = FileHandle.nullDevice; child.standardOutput = FileHandle.nullDevice
+        errorHandle = errors.fileHandleForReading
+        errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            Task { await self?.receiveStderr(data) }
+        }
+        do {
+            try child.run(); process = child
+            guard let port = webSocketConfiguration.url.port else { throw CodexError.invalidConfiguration("Missing tunnel port") }
+            let deadline = ContinuousClock.now + .seconds(30)
+            while true {
+                try Task.checkCancellation()
+                guard !closing else { throw CodexError.closing }
+                guard child.isRunning else { throw CodexError.transportClosed("SSH exited: \(String(decoding: stderrTail, as: UTF8.self))") }
+                if await LoopbackProbe.connect(port: port) { break }
+                guard ContinuousClock.now < deadline else { throw CodexError.transportClosed("SSH tunnel did not become ready") }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try Task.checkCancellation()
+            guard !closing, child.isRunning else { throw CodexError.transportClosed("SSH exited during startup") }
+            let transport = try await CodexWebSocketTransport.factory(configuration: webSocketConfiguration).makeTransport()
+            inner = transport
+            try await transport.start()
+            guard !closing else { throw CodexError.closing }
+            let incoming = transport.incomingFrames, diagnostics = transport.diagnostics
+            tasks = [Task { [weak self] in
+                do { for try await frame in incoming { self?.frames.yield(frame) }; self?.frames.finish() }
+                catch { self?.frames.finish(throwing: error) }
+            }, Task { [weak self] in for await value in diagnostics { self?.diagnostic.yield(value) } }]
+        } catch {
+            await close()
+            throw error
+        }
     }
     func send(frame: Data) async throws { guard let inner else { throw CodexError.disconnected }; try await inner.send(frame: frame) }
-    func close() async { for task in tasks { task.cancel() }; tasks.removeAll(); await inner?.close(); inner = nil; if let process, process.isRunning { process.terminate() }; process = nil; frames.finish(); diagnostic.finish() }
+    func close() async {
+        closing = true
+        for task in tasks { task.cancel() }; tasks.removeAll()
+        let old = inner; inner = nil
+        if shutdownTask == nil, let child = process { shutdownTask = Task { await terminateOwnedProcess(child) } }
+        errorHandle?.readabilityHandler = nil; errorHandle = nil
+        await old?.close()
+        await shutdownTask?.value
+        process = nil; frames.finish(); diagnostic.finish()
+    }
+    private func receiveStderr(_ data: Data) {
+        guard !data.isEmpty else { return }
+        stderrTail.append(data)
+        if stderrTail.count > 65_536 { stderrTail.removeFirst(stderrTail.count - 65_536) }
+        diagnostic.yield(.init(level: .debug, message: String(decoding: data, as: UTF8.self)))
+    }
+}
+
+private func terminateOwnedProcess(_ child: Process) async {
+    if child.isRunning {
+        child.terminate()
+        try? await Task.sleep(for: .milliseconds(100))
+        if child.isRunning { _ = Darwin.kill(child.processIdentifier, SIGKILL) }
+    }
+    await Task.detached { child.waitUntilExit() }.value
+}
+
+/// Each probe is bounded, including cancellation while the listener is still starting.
+private final class LoopbackProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let connection: NWConnection
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var completed = false
+    private static let queue = DispatchQueue(label: "codex.ssh.readiness")
+    private init(port: Int) {
+        connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(port))!, using: .tcp)
+    }
+    static func connect(port: Int) async -> Bool {
+        let probe = LoopbackProbe(port: port)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in probe.start(continuation) }
+        } onCancel: { probe.finish(false) }
+    }
+    private func start(_ continuation: CheckedContinuation<Bool, Never>) {
+        let cancelled = lock.withLock {
+            guard !completed else { return true }
+            self.continuation = continuation
+            return false
+        }
+        guard !cancelled else { continuation.resume(returning: false); return }
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state { case .ready: self?.finish(true); case .failed, .waiting, .cancelled: self?.finish(false); default: break }
+        }
+        connection.start(queue: Self.queue)
+        Self.queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.finish(false) }
+    }
+    private func finish(_ ready: Bool) {
+        let receiver = lock.withLock {
+            guard !completed else { return Optional<CheckedContinuation<Bool, Never>>.none }
+            completed = true
+            let receiver = continuation; continuation = nil
+            return receiver
+        }
+        connection.cancel()
+        receiver?.resume(returning: ready)
+    }
 }
 #endif

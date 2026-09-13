@@ -34,6 +34,8 @@ let turn = try await client.startTurn(threadID: task.id, prompt: "Explain this p
 
 Each `subscribe()` or `events(for:)` call creates an independent multicast subscription. The default buffer is 1,024 events and fails only the slow subscriber. Delta-coalescing and unbounded policies are explicit alternatives.
 
+Coalescing preserves adjacent text fragments for the same item and segment. Incompatible events cause an explicit overflow failure rather than silent data loss. Each subscription supports one event iterator; call `cancel()` when its consumer finishes.
+
 ## Lifecycle and durable local tasks
 
 Isolated stdio intentionally creates an independent app-server. To let multiple controllers—including your app on another Mac—share live turns and approvals, bootstrap and reuse one managed daemon:

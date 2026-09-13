@@ -39,21 +39,31 @@ public final class CodexConversationDetailModel {
     private var task: Task<Void, Never>?
     public init(threadID: String) { self.threadID = threadID }
     public func observe(_ client: CodexClient) async throws {
-        thread = try await client.subscribeThread(id: threadID)
+        task?.cancel()
+        // Subscribe before requesting history so live changes cannot fall into a gap.
         let subscription = await client.events(for: threadID, policy: .boundedCoalescingDeltas(1_024))
-        task?.cancel(); task = Task { @MainActor [weak self] in
+        do {
+            _ = try await client.subscribeThread(id: threadID)
+            if let snapshot = await client.state(for: threadID) { apply(snapshot) }
+        } catch { subscription.cancel(); throw error }
+        task = Task { @MainActor [weak self] in
+            defer { subscription.cancel() }
             do {
-                for try await event in subscription.events {
+                for try await _ in subscription.events {
                     guard let self else { return }
-                    switch event {
-                    case .itemStarted(_, let item), .itemCompleted(_, let item): if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = item } else { items.append(item) }
-                    case .turnStarted(_, let turn), .turnCompleted(_, let turn): if let index = turns.firstIndex(where: { $0.id == turn.id }) { turns[index] = turn } else { turns.append(turn) }
-                    default: break
+                    if let snapshot = await client.state(for: threadID) {
+                        guard !Task.isCancelled else { return }
+                        apply(snapshot)
                     }
-                    if let state = await client.state(for: threadID) { publisher.send(state) }
                 }
             } catch {}
         }
+    }
+    private func apply(_ snapshot: CodexThreadState) {
+        thread = snapshot.thread
+        turns = snapshot.turnOrder.compactMap { snapshot.turns[$0] }
+        items = snapshot.itemOrder.compactMap { snapshot.items[$0] }
+        publisher.send(snapshot)
     }
     public func stopObserving() { task?.cancel(); task = nil }
 }
@@ -88,8 +98,8 @@ public final class CodexPendingInteractionModel {
                     guard let self else { return }
                     switch event {
                     case .serverRequest(let interaction): pending.append(interaction)
-                    case .serverRequestResolved(let raw): if let id = raw["requestId"]?.stringValue { pending.removeAll { $0.id == id } }
-                    case .connection(.disconnected), .connection(.failed), .connection(.reconnecting): pending.removeAll()
+                    case .serverRequestResolved(let raw): if let id = raw["requestId"] { pending.removeAll { $0.requestID == id } }
+                    case .connection(.disconnected), .connection(.failed), .connection(.reconnecting), .connection(.connecting): pending.removeAll()
                     default: break
                     }
                     publisher.send(pending)

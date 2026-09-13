@@ -98,11 +98,11 @@ public struct CodexLogger: Sendable {
         return String(decoding: (try? output.encoded(sortedKeys: true)) ?? Data(), as: UTF8.self)
     }
     private static func redact(_ metadata: [String: String]) -> [String: String] {
-        let keys = ["authorization", "token", "secret", "grant", "pairing", "cookie"]
+        let keys = ["authorization", "token", "secret", "grant", "pairing", "cookie", "apikey", "api_key", "api-key", "password"]
         return Dictionary(uniqueKeysWithValues: metadata.map { key, value in (key, keys.contains(where: { key.lowercased().contains($0) }) ? "<redacted>" : value) })
     }
     private static func redactJSON(_ value: JSONValue) -> JSONValue {
-        let keys = ["authorization", "token", "secret", "grant", "pairing", "cookie"]
+        let keys = ["authorization", "token", "secret", "grant", "pairing", "cookie", "apikey", "api_key", "api-key", "password"]
         switch value {
         case .array(let values): return .array(values.map(redactJSON))
         case .object(let values): return .object(values.mapValues(redactJSON).mapValues { $0 }.reduce(into: [:]) { result, element in result[element.key] = keys.contains(where: { element.key.lowercased().contains($0) }) ? .string("<redacted>") : element.value })

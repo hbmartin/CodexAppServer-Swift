@@ -19,7 +19,9 @@ jobs:
       - name: Build with strict concurrency
         run: swift build -Xswiftc -strict-concurrency=complete
       - name: Test
-        run: swift test -Xswiftc -strict-concurrency=complete
+        run: |
+          npm install --global @openai/codex@0.146.0
+          RUN_CODEX_PROCESS_TESTS=1 swift test -Xswiftc -strict-concurrency=complete
       - name: Build documentation
         run: |
           xcodebuild docbuild -scheme CodexAppServerKit -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO

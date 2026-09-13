@@ -62,9 +62,10 @@ public enum CodexItemKind: Sendable, Equatable {
 }
 public struct CodexItem: CodexRawModel, Identifiable {
     public let raw: JSONValue
+    public let turnID: String?
     public var id: String { raw["id"]?.stringValue ?? "" }
     public var kind: CodexItemKind { .init(raw["type"]?.stringValue ?? "unknown") }
-    public init(raw: JSONValue) { self.raw = raw }
+    public init(raw: JSONValue, turnID: String? = nil) { self.raw = raw; self.turnID = turnID }
 }
 
 public struct CodexPage<Element: Sendable & Equatable>: Sendable, Equatable {
@@ -146,11 +147,12 @@ public enum CodexInput: Sendable, Equatable {
 public struct CodexModel: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["id"]?.stringValue ?? raw["model"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
 public struct CodexSkill: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["name"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
 public struct CodexCollaborationMode: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["name"]?.stringValue ?? raw["mode"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
-public struct CodexPermissionProfile: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["name"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
+public struct CodexPermissionProfile: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["id"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
 
 public struct CodexReviewTarget: Sendable, Equatable {
     public enum Kind: Sendable, Equatable { case uncommitted, baseBranch(String), commit(String), custom(String) }
     public var kind: Kind
+    /// Overrides the prompt of a custom target. Other review target kinds do not accept instructions.
     public var instructions: String?
     public init(_ kind: Kind, instructions: String? = nil) { self.kind = kind; self.instructions = instructions }
     var json: JSONValue {
@@ -158,10 +160,10 @@ public struct CodexReviewTarget: Sendable, Equatable {
         switch kind {
         case .uncommitted: value = ["type": "uncommittedChanges"]
         case .baseBranch(let branch): value = ["type": "baseBranch", "branch": .string(branch)]
-        case .commit(let commit): value = ["type": "commit", "commit": .string(commit)]
-        case .custom(let prompt): value = ["type": "custom", "prompt": .string(prompt)]
+        case .commit(let commit): value = ["type": "commit", "sha": .string(commit)]
+        case .custom(let prompt): value = ["type": "custom", "instructions": .string(prompt)]
         }
-        if let instructions { value["instructions"] = .string(instructions) }
+        if case .custom = kind, let instructions { value["instructions"] = .string(instructions) }
         return .object(value)
     }
 }
