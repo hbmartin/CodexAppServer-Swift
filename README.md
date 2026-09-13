@@ -128,7 +128,7 @@ The SDK uses the platform TLS trust store and exposes no trust bypass, hostname 
 
 Supported deployments are (a) the Unix daemon behind a caller-managed authenticated WSS-to-Unix bridge, or (b) a supervised loopback WebSocket listener reached locally, through WSS, or by SSH forwarding. The SDK does not install or configure Tailscale, Cloudflare Tunnel, DNS, certificates, or reverse proxies.
 
-System SSH always uses `BatchMode=yes` and normal known-host enforcement. Pass an existing host alias or structured hostname/user/port/identity settings. Only a conservative allowlist of extra OpenSSH options is accepted.
+System SSH always uses `BatchMode=yes` and normal known-host enforcement. Pass an existing host alias or structured hostname/user/port/identity settings. Only a conservative allowlist of extra OpenSSH options is accepted. SSH forwarding requires OpenSSH 8.7 or newer, or a compatible client that supports `ForkAfterAuthentication`.
 
 ## Experimental WHAM controller
 
