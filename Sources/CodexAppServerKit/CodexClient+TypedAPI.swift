@@ -14,7 +14,6 @@ public extension CodexClient {
         let result = try await rawRequest(method: "thread/read", params: ["threadId": .string(id), "includeTurns": .bool(includeTurns)])
         guard let raw = result["thread"] else { throw CodexError.missingField("thread") }
         let thread = CodexThread(raw: raw)
-        var state = threadStates[id] ?? .init(); state.thread = thread; threadStates[id] = state
         return thread
     }
 
@@ -26,11 +25,10 @@ public extension CodexClient {
 
     @discardableResult
     func subscribeThread(id: String) async throws -> CodexThread {
-        let thread = try await resumeThread(id: id)
+        _ = try await resumeThread(id: id)
         subscriptionIntents.insert(id)
         if subscriptionIntents.count == 9 { emit(.diagnostic(.highThreadSubscriptionCount(subscriptionIntents.count))) }
-        _ = try await readThread(id: id, includeTurns: true)
-        return thread
+        return try await readThread(id: id, includeTurns: true)
     }
 
     func unsubscribeThread(id: String) async throws {
@@ -50,14 +48,15 @@ public extension CodexClient {
         let tools = await dynamicTools.specifications(); if !tools.isEmpty { params["dynamicTools"] = .array(tools) }
         let result = try await rawRequest(method: "thread/start", params: .object(params))
         guard let raw = result["thread"] else { throw CodexError.missingField("thread") }
-        let thread = CodexThread(raw: raw); threadStates[thread.id] = .init(thread: thread); return thread
+        return CodexThread(raw: raw)
     }
 
     @discardableResult
     func resumeThread(id: String) async throws -> CodexThread {
         let result = try await rawRequest(method: "thread/resume", params: ["threadId": .string(id)])
         guard let raw = result["thread"] else { throw CodexError.missingField("thread") }
-        let thread = CodexThread(raw: raw); var state = threadStates[id] ?? .init(); state.thread = thread; threadStates[id] = state; return thread
+        let thread = CodexThread(raw: raw)
+        return thread
     }
 
     @discardableResult
@@ -80,7 +79,11 @@ public extension CodexClient {
         var params: [String: JSONValue] = ["threadId": .string(threadID)]
         if let turnID { params["turnId"] = .string(turnID) }; if let cursor { params["cursor"] = .string(cursor) }; if let limit { params["limit"] = .number(Decimal(limit)) }
         let result = try await rawRequest(method: "thread/items/list", params: .object(params))
-        return .init(items: (result["data"]?.arrayValue ?? result["items"]?.arrayValue ?? []).map(CodexItem.init), nextCursor: result["nextCursor"]?.stringValue, raw: result)
+        let items = try (result["data"]?.arrayValue ?? []).map { entry -> CodexItem in
+            guard let raw = entry["item"] else { throw CodexError.missingField("item") }
+            return CodexItem(raw: raw, turnID: entry["turnId"]?.stringValue)
+        }
+        return .init(items: items, nextCursor: result["nextCursor"]?.stringValue, raw: result)
     }
 
     func renameThread(id: String, name: String) async throws { _ = try await rawRequest(method: "thread/name/set", params: ["threadId": .string(id), "name": .string(name)]) }
@@ -103,21 +106,28 @@ public extension CodexClient {
     func startTurn(threadID: String, prompt: String, options: CodexTurnOptions = .init()) async throws -> CodexTurn { try await startTurn(threadID: threadID, inputs: [.text(prompt)], options: options) }
 
     @discardableResult
+    /// Returns an acknowledgement with the server's turn ID; status and items are not returned by steering.
     func steerTurn(threadID: String, expectedTurnID: String, inputs: [CodexInput]) async throws -> CodexTurn {
         let result = try await rawRequest(method: "turn/steer", params: ["threadId": .string(threadID), "expectedTurnId": .string(expectedTurnID), "input": .array(inputs.map(\.json))])
-        let raw = result["turn"] ?? result
-        return .init(threadID: threadID, raw: raw)
+        guard let id = result["turnId"]?.stringValue else { throw CodexError.missingField("turnId") }
+        // Steering acknowledges an ID; it does not return a new turn snapshot.
+        var raw = result.objectValue ?? [:]; raw["id"] = .string(id)
+        return .init(threadID: threadID, raw: .object(raw))
     }
 
     func interruptTurn(threadID: String, turnID: String) async throws { _ = try await rawRequest(method: "turn/interrupt", params: ["threadId": .string(threadID), "turnId": .string(turnID)]) }
     func turnStatus(threadID: String, turnID: String) -> String? { threadStates[threadID]?.turns[turnID]?.status }
     func turnPlan(threadID: String) -> CodexItem? { threadStates[threadID]?.items.values.first(where: { $0.kind == CodexItemKind.plan }) }
     func turnDiff(threadID: String) -> [CodexItem] { threadStates[threadID]?.items.values.filter { $0.kind == .fileChange } ?? [] }
-    func turnUsage(threadID: String) -> JSONValue? { threadStates[threadID]?.thread?.raw["tokenUsage"] }
+    /// Latest usage payload containing cumulative `total` and most recent turn `last` counters.
+    func turnUsage(threadID: String) -> JSONValue? { threadStates[threadID]?.tokenUsage }
 
     func startReview(threadID: String, target: CodexReviewTarget, detached: Bool = false) async throws -> JSONValue { try await rawRequest(method: "review/start", params: ["threadId": .string(threadID), "target": target.json, "delivery": .string(detached ? "detached" : "inline")]) }
     func listModels() async throws -> [CodexModel] { let result = try await rawRequest(method: "model/list"); return (result["data"]?.arrayValue ?? result["models"]?.arrayValue ?? []).map(CodexModel.init) }
-    func listSkills() async throws -> [CodexSkill] { let result = try await rawRequest(method: "skills/list"); return (result["data"]?.arrayValue ?? result["skills"]?.arrayValue ?? []).map(CodexSkill.init) }
+    func listSkills() async throws -> [CodexSkill] {
+        let result = try await rawRequest(method: "skills/list")
+        return (result["data"]?.arrayValue ?? []).flatMap { ($0["skills"]?.arrayValue ?? []).map(CodexSkill.init) }
+    }
     func listCollaborationModes() async throws -> [CodexCollaborationMode] { let result = try await rawRequest(method: "collaborationMode/list"); return (result["data"]?.arrayValue ?? []).map(CodexCollaborationMode.init) }
     func listPermissionProfiles() async throws -> [CodexPermissionProfile] { let result = try await rawRequest(method: "permissionProfile/list"); return (result["data"]?.arrayValue ?? []).map(CodexPermissionProfile.init) }
 

@@ -22,6 +22,7 @@ private actor FakeTransport: CodexTransport {
         case "thread/list": result = ["data": [["id": "thread-1", "name": "One"]], "nextCursor": nil]
         case "thread/start": result = ["thread": ["id": "thread-new"]]
         case "thread/resume", "thread/read": result = ["thread": ["id": request["params"]?["threadId"] ?? "thread-1"]]
+        case "turn/steer": result = ["turnId": "turn-1"]
         case "turn/start": result = ["turn": ["id": "turn-1", "status": "inProgress"]]
         default: result = ["method": .string(method)]
         }
@@ -145,12 +146,12 @@ private func makeClient(_ transport: FakeTransport, configuration: CodexClientCo
     await client.close()
 }
 
-@Test func boundedCoalescingKeepsLatestDelta() async throws {
+@Test func boundedCoalescingPreservesAllText() async throws {
     let transport = FakeTransport(), client = makeClient(transport); _ = try await client.connect()
     let subscription = await client.subscribe(policy: .boundedCoalescingDeltas(1))
-    for index in 0..<20 { try await transport.inject(["method": "item/agentMessage/delta", "params": ["threadId": "t", "delta": .number(Decimal(index))]]) }
+    for index in 0..<20 { try await transport.inject(["method": "item/agentMessage/delta", "params": ["threadId": "t", "itemId": "i", "delta": .string("\(index),")]]) }
     try await Task.sleep(for: .milliseconds(10)); var iterator = subscription.events.makeAsyncIterator(); let event = try await iterator.next()
-    if case .itemDelta(_, _, _, let raw) = event { #expect(raw["delta"]?.intValue == 19) } else { Issue.record("expected delta") }
+    if case .itemDelta(_, _, _, let raw) = event { #expect(raw["delta"]?.stringValue == (0..<20).map { "\($0)," }.joined()) } else { Issue.record("expected delta") }
     await client.close()
 }
 

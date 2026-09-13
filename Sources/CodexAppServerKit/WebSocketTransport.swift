@@ -81,6 +81,7 @@ private actor WebSocketConnection: CodexTransport {
         }
         let session = URLSession(configuration: configuration.urlSessionConfiguration)
         let socket = session.webSocketTask(with: request)
+        socket.maximumMessageSize = configuration.maximumFrameBytes
         self.session = session; self.socket = socket; started = true; socket.resume()
         receiveTask = Task { [weak self] in await self?.receiveLoop(socket) }
     }

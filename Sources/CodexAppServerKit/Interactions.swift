@@ -67,8 +67,9 @@ public actor CodexInteractionResponseHandle {
     init(client: CodexClient, requestID: JSONValue, generation: UInt64) { self.client = client; self.requestID = requestID; self.generation = generation }
     public func respond(_ response: CodexInteractionResponse) async throws {
         guard !used else { throw CodexError.responseAlreadySent }
-        try await client.respondToServerRequest(id: requestID, response: response, generation: generation)
+        // Once attempted, a response is never retried: a transport failure may occur after delivery.
         used = true
+        try await client.respondToServerRequest(id: requestID, response: response, generation: generation)
     }
 }
 public typealias CodexInteractionHandler = @Sendable (CodexPendingInteraction) async -> CodexInteractionResponse?

@@ -108,7 +108,9 @@ private actor WHAMConnection: CodexTransport {
     func start() async throws {
         var components = URLComponents(url: endpoints.url(path: endpoints.controllerWebSocketPath), resolvingAgainstBaseURL: false)!; components.scheme = components.scheme == "http" ? "ws" : "wss"
         var request = URLRequest(url: components.url!); request.setValue("Bearer \(try await credentials.accountBearer())", forHTTPHeaderField: "Authorization"); request.setValue(grant.grant, forHTTPHeaderField: "x-codex-pairing-grant"); request.setValue(hostID, forHTTPHeaderField: "x-codex-server-id"); request.setValue("2", forHTTPHeaderField: "x-codex-protocol-version"); request.setValue(String(await cursor.current()), forHTTPHeaderField: "x-codex-subscribe-cursor")
-        let session = URLSession(configuration: .ephemeral), socket = session.webSocketTask(with: request); self.session = session; self.socket = socket; socket.resume()
+        let session = URLSession(configuration: .ephemeral), socket = session.webSocketTask(with: request)
+        socket.maximumMessageSize = maximumFrameBytes
+        self.session = session; self.socket = socket; socket.resume()
         tasks = [Task { [weak self] in await self?.receiveLoop(socket) }, Task { [weak self] in await self?.pingLoop(socket) }]
     }
     func send(frame: Data) async throws {

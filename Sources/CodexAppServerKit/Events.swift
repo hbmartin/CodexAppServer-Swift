@@ -7,6 +7,7 @@ public enum CodexDiagnostic: Sendable, Equatable {
 }
 public enum CodexEvent: Sendable, Equatable {
     case connection(CodexConnectionState)
+    case threadStateUpdated(threadID: String, state: CodexThreadState)
     case notification(method: String, params: JSONValue)
     case serverRequest(CodexPendingInteraction), serverRequestResolved(JSONValue)
     case itemStarted(threadID: String?, item: CodexItem)
@@ -22,6 +23,8 @@ public enum CodexEvent: Sendable, Equatable {
         switch self {
         case .itemStarted(let id, _), .itemDelta(let id, _, _, _), .itemCompleted(let id, _), .turnStarted(let id, _), .turnCompleted(let id, _): id
         case .serverRequest(let request): request.threadID
+        case .threadStateUpdated(let id, _): id
+        case .serverRequestResolved(let params): params["threadId"]?.stringValue
         case .notification(_, let params): params["threadId"]?.stringValue ?? params["thread"]?["id"]?.stringValue
         default: nil
         }
@@ -38,7 +41,7 @@ public struct CodexCommandOutput: Sendable, Equatable {
     public init(raw: JSONValue) {
         self.raw = raw; processID = raw["processId"]?.stringValue ?? ""
         stream = Stream(rawValue: raw["stream"]?.stringValue ?? "") ?? .unknown
-        data = Data(base64Encoded: raw["delta"]?.stringValue ?? raw["dataBase64"]?.stringValue ?? "") ?? Data()
+        data = Data(base64Encoded: raw["deltaBase64"]?.stringValue ?? "") ?? Data()
     }
 }
 
@@ -47,5 +50,12 @@ public struct CodexThreadState: Sendable, Equatable {
     public var turns: [String: CodexTurn]
     public var items: [String: CodexItem]
     public var activeTurnIDs: Set<String>
-    public init(thread: CodexThread? = nil, turns: [String: CodexTurn] = [:], items: [String: CodexItem] = [:], activeTurnIDs: Set<String> = []) { self.thread = thread; self.turns = turns; self.items = items; self.activeTurnIDs = activeTurnIDs }
+    /// Latest thread/tokenUsage/updated payload: cumulative `total` and latest-turn `last` usage.
+    public var tokenUsage: JSONValue?
+    public var turnOrder: [String]
+    public var itemOrder: [String]
+    public init(thread: CodexThread? = nil, turns: [String: CodexTurn] = [:], items: [String: CodexItem] = [:], activeTurnIDs: Set<String> = [], tokenUsage: JSONValue? = nil, turnOrder: [String] = [], itemOrder: [String] = []) {
+        self.thread = thread; self.turns = turns; self.items = items; self.activeTurnIDs = activeTurnIDs
+        self.tokenUsage = tokenUsage; self.turnOrder = turnOrder; self.itemOrder = itemOrder
+    }
 }
