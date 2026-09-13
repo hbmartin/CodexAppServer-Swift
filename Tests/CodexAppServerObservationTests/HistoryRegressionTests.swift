@@ -12,6 +12,7 @@ private actor ReviewTransport: CodexTransport {
     var closed = false
     var results: [String: JSONValue]
     var delayResponses: Bool
+    var historyGate: ObservationHistoryGate?
     var replayOnResume: Bool
     init(results: [String: JSONValue] = [:], delayResponses: Bool = false, replayOnResume: Bool = false) {
         self.replayOnResume = replayOnResume
@@ -20,10 +21,12 @@ private actor ReviewTransport: CodexTransport {
         let d = AsyncStream<CodexTransportDiagnostic>.makeStream(); diagnostics = d.stream; diagnostic = d.continuation
     }
     func start() {}
+    func holdHistory(at gate: ObservationHistoryGate) { historyGate = gate }
     func send(frame: Data) async throws {
         let message = try JSONValue.decode(frame); sent.append(message)
         if message["result"] != nil, delayResponses { try await Task.sleep(for: .milliseconds(50)) }
         guard let id = message["id"], let method = message["method"]?.stringValue else { return }
+        if method == "thread/resume", let historyGate { await historyGate.wait() }
         if method == "thread/resume", replayOnResume {
             try inject(["id": 55, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
             try await Task.sleep(for: .milliseconds(100))
@@ -99,4 +102,42 @@ private actor ObservationTransportSequence {
     }
     #expect(model.pending.isEmpty)
     model.stopObserving(); await client.close()
+}
+
+private actor ObservationHistoryGate {
+    var waiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            waiting = true
+        }
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+@Test @MainActor func stoppingObservationDuringHistorySetupPreventsLateUpdates() async throws {
+    let history: JSONValue = ["thread": ["id": "t", "turns": [["id": "u", "status": "completed", "items": [["id": "i", "type": "agentMessage"]]]]]]
+    let transport = ReviewTransport(results: ["thread/resume": history, "thread/read": history])
+    let client = try await reviewClient(transport)
+    let gate = ObservationHistoryGate()
+    await transport.holdHistory(at: gate)
+    let model = CodexConversationDetailModel(threadID: "t")
+    var published = 0
+    let token = model.publisher.sink { _ in published += 1 }
+    let setup = Task { try await model.observe(client) }
+    while !(await gate.waiting) { await Task.yield() }
+    model.stopObserving()
+    await gate.release()
+    try await setup.value
+    #expect(model.thread == nil)
+    #expect(model.turns.isEmpty)
+    #expect(model.items.isEmpty)
+    #expect(published == 0)
+    // A later state update must not revive the cancelled subscription.
+    _ = try await client.readThread(id: "t", includeTurns: true)
+    await client.close()
+    for _ in 0..<10 { await Task.yield() }
+    #expect(published == 0)
+    token.cancel()
 }

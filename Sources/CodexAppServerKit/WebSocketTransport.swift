@@ -56,6 +56,7 @@ private actor WebSocketConnection: CodexTransport {
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var started = false
+    private var closing = false
 
     init(configuration: CodexWebSocketConfiguration) {
         self.configuration = configuration
@@ -64,6 +65,7 @@ private actor WebSocketConnection: CodexTransport {
     }
 
     func start() async throws {
+        guard !closing else { throw CodexError.closing }
         guard !started else { throw CodexError.alreadyConnected }
         var request = URLRequest(url: configuration.url)
         switch configuration.security {
@@ -79,6 +81,8 @@ private actor WebSocketConnection: CodexTransport {
                 let bearer = try await bearerProvider.credential(); if !bearer.value.isEmpty { request.setValue("Bearer \(bearer.value)", forHTTPHeaderField: "Authorization") }
             }
         }
+        try Task.checkCancellation()
+        guard !closing else { throw CodexError.closing }
         let session = URLSession(configuration: configuration.urlSessionConfiguration)
         let socket = session.webSocketTask(with: request)
         socket.maximumMessageSize = configuration.maximumFrameBytes
@@ -94,7 +98,8 @@ private actor WebSocketConnection: CodexTransport {
     }
 
     func close() async {
-        guard started else { return }; started = false
+        closing = true
+        started = false
         receiveTask?.cancel(); receiveTask = nil
         socket?.cancel(with: .goingAway, reason: nil); socket = nil
         session?.invalidateAndCancel(); session = nil

@@ -321,10 +321,10 @@ public actor CodexClient {
         if method == "fuzzyFileSearch/sessionUpdated" { emit(.fileSearchUpdated(params)); return }
         if method == "fuzzyFileSearch/sessionCompleted" { emit(.fileSearchCompleted(params)); return }
         if method == "item/started", let raw = params["item"] {
-            let item = CodexItem(raw: raw); reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
+            let item = CodexItem(raw: raw, turnID: params["turnId"]?.stringValue); reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
         }
         if method == "item/completed", let raw = params["item"] {
-            let item = CodexItem(raw: raw); reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
+            let item = CodexItem(raw: raw, turnID: params["turnId"]?.stringValue); reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
         }
         if method == "turn/started", let raw = params["turn"] {
             let turn = CodexTurn(threadID: threadID ?? "", raw: raw); reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
@@ -435,7 +435,7 @@ public actor CodexClient {
                 snapshot.turns[turn.id] = turn
                 if turn.status == "inProgress" { snapshot.activeTurnIDs.insert(turn.id) }
                 for rawItem in rawTurn["items"]?.arrayValue ?? [] {
-                    let item = CodexItem(raw: rawItem)
+                    let item = CodexItem(raw: rawItem, turnID: turn.id)
                     guard !item.id.isEmpty else { continue }
                     if snapshot.items[item.id] == nil { snapshot.itemOrder.append(item.id) }
                     snapshot.items[item.id] = item

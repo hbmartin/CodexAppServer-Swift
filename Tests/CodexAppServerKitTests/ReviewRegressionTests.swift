@@ -139,7 +139,7 @@ private actor ReviewFactoryGate {
     _ = try await client.readThread(id: "t", includeTurns: true)
     #expect(await client.turnStatus(threadID: "t", turnID: "u") == "completed")
     #expect(await client.state(for: "t")?.activeTurnIDs.isEmpty == true)
-    #expect(await client.state(for: "t")?.items["i"] != nil)
+    #expect(await client.state(for: "t")?.items["i"]?.turnID == "u")
     await client.close()
 }
 
@@ -299,7 +299,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
     #expect(!buffer.yield(next))
     #expect(try await buffer.next() == first)
     do { _ = try await buffer.next(); Issue.record("overflow was hidden") }
-    catch { #expect(error as? CodexError == .transportClosed("subscriber buffer overflow")) }
+    catch { #expect(error as? CodexSubscriptionError == .bufferOverflow) }
 }
 
 @Test func cancellingIdleEventIteratorFinishesIt() async throws {
@@ -324,4 +324,59 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
     _ = try await client.connect()
     #expect(await transport.messages().contains { $0["id"] == 56 && $0["result"] != nil })
     await client.close()
+}
+
+@Test func reviewItemLifecycleRetainsOwningTurn() async throws {
+    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let subscription = await client.events(for: "t", policy: .unbounded)
+    var iterator = subscription.events.makeAsyncIterator()
+    for method in ["item/started", "item/completed"] {
+        try await transport.inject(["method": .string(method), "params": ["threadId": "t", "turnId": "u", "item": ["id": "i", "type": "agentMessage"]]])
+        let event = try await iterator.next()
+        switch event {
+        case .itemStarted(let threadID, let item) where method == "item/started",
+             .itemCompleted(let threadID, let item) where method == "item/completed":
+            #expect(threadID == "t")
+            #expect(item.turnID == "u")
+        default: Issue.record("Missing lifecycle event: \(String(describing: event))")
+        }
+        #expect(await client.state(for: "t")?.items["i"]?.turnID == "u")
+    }
+    subscription.cancel(); await client.close()
+}
+
+@Test(arguments: ["apiKey", "API_KEY", "api-key", "Password"])
+func reviewLoggerRedactsSensitiveMetadataInSink(fragment: String) {
+    let key = "prefix-" + fragment + "-suffix"
+    let secret = "review-only-sensitive-value"
+    let logger = CodexLogger(payloadMode: .full) { _, message, metadata in
+        let rendered = CodexLogger(payloadMode: .full).render(.object(metadata.mapValues(JSONValue.string)))
+        #expect(message == "metadata regression")
+        #expect(metadata[key] == "<redacted>")
+        #expect(metadata["safe"] == "visible")
+        #expect(rendered.contains("<redacted>"))
+        #expect(!rendered.contains(secret))
+    }
+    logger.log(.info, "metadata regression", metadata: [key: secret, "safe": "visible"])
+}
+
+@Test(arguments: [CodexBufferingPolicy.boundedFailing(1), .boundedCoalescingDeltas(1)])
+func reviewSubscriberOverflowDoesNotCloseClient(policy: CodexBufferingPolicy) async throws {
+    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let slow = await client.subscribe(policy: policy)
+    let healthy = await client.subscribe(policy: .unbounded)
+    let event = CodexEvent.itemCompleted(threadID: "t", item: .init(raw: ["id": "i"]))
+    await client.emit(event); await client.emit(event)
+    var slowIterator = slow.events.makeAsyncIterator()
+    #expect(try await slowIterator.next() == event)
+    do { _ = try await slowIterator.next(); Issue.record("Expected subscription overflow") }
+    catch {
+        #expect(error as? CodexSubscriptionError == .bufferOverflow)
+        #expect(error.localizedDescription == "subscriber buffer overflow")
+    }
+    var healthyIterator = healthy.events.makeAsyncIterator()
+    #expect(try await healthyIterator.next() == event)
+    #expect(try await healthyIterator.next() == event)
+    #expect(await client.connectionState() == .connected(generation: 1))
+    healthy.cancel(); await client.close()
 }

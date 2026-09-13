@@ -37,24 +37,40 @@ public final class CodexConversationDetailModel {
     public private(set) var items: [CodexItem] = []
     @ObservationIgnored public let publisher = PassthroughSubject<CodexThreadState, Never>()
     private var task: Task<Void, Never>?
+    private var subscription: CodexSubscription?
+    private var observationGeneration = UUID()
     public init(threadID: String) { self.threadID = threadID }
     public func observe(_ client: CodexClient) async throws {
-        task?.cancel()
+        stopObserving()
+        let generation = observationGeneration
         // Subscribe before requesting history so live changes cannot fall into a gap.
         let subscription = await client.events(for: threadID, policy: .boundedCoalescingDeltas(1_024))
+        guard observationGeneration == generation else { subscription.cancel(); return }
+        self.subscription = subscription
         do {
+            try Task.checkCancellation()
             _ = try await client.subscribeThread(id: threadID)
-            if let snapshot = await client.state(for: threadID) { apply(snapshot) }
-        } catch { subscription.cancel(); throw error }
+            guard observationGeneration == generation else { return }
+            try Task.checkCancellation()
+            let snapshot = await client.state(for: threadID)
+            guard observationGeneration == generation else { return }
+            try Task.checkCancellation()
+            if let snapshot { apply(snapshot) }
+        } catch {
+            subscription.cancel()
+            if observationGeneration == generation { self.subscription = nil }
+            throw error
+        }
+        // Publishing a snapshot can synchronously stop or replace observation.
+        guard observationGeneration == generation else { return }
         task = Task { @MainActor [weak self] in
             defer { subscription.cancel() }
             do {
                 for try await _ in subscription.events {
-                    guard let self else { return }
-                    if let snapshot = await client.state(for: threadID) {
-                        guard !Task.isCancelled else { return }
-                        apply(snapshot)
-                    }
+                    guard let self, observationGeneration == generation, !Task.isCancelled else { return }
+                    let snapshot = await client.state(for: threadID)
+                    guard observationGeneration == generation, !Task.isCancelled else { return }
+                    if let snapshot { apply(snapshot) }
                 }
             } catch {}
         }
@@ -65,7 +81,11 @@ public final class CodexConversationDetailModel {
         items = snapshot.itemOrder.compactMap { snapshot.items[$0] }
         publisher.send(snapshot)
     }
-    public func stopObserving() { task?.cancel(); task = nil }
+    public func stopObserving() {
+        observationGeneration = UUID()
+        subscription?.cancel(); subscription = nil
+        task?.cancel(); task = nil
+    }
 }
 
 @MainActor @Observable
