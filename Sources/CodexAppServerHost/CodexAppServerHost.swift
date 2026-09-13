@@ -106,6 +106,10 @@ public enum CodexHostTransports {
         let arguments = try CodexSSHArguments.build(host: host, remoteArguments: ["codex", "app-server", "proxy"])
         return process(executableURL: sshURL, arguments: arguments, environment: ProcessInfo.processInfo.environment, maximumFrameBytes: maximumFrameBytes)
     }
+    /// Creates a loopback WebSocket transport forwarded through SSH.
+    ///
+    /// The executable at `sshURL` must be OpenSSH 8.7 or newer, or a compatible
+    /// client that supports the `ForkAfterAuthentication` configuration option.
     public static func sshForward(sshURL: URL = URL(fileURLWithPath: "/usr/bin/ssh"), host: CodexSSHHost, localPort: Int, remotePort: Int, remoteHost: String = "127.0.0.1", path: String = "/", bearer: (any CodexBearerCredentialProvider)? = nil) throws -> CodexTransportFactory {
         guard (1...65535).contains(localPort), (1...65535).contains(remotePort) else { throw CodexError.invalidConfiguration("SSH forwarding requires explicit valid local and remote ports") }
         let args = try CodexSSHArguments.build(host: host, remoteArguments: [])
