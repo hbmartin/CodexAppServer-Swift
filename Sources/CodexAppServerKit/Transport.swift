@@ -28,6 +28,12 @@ public enum CodexBufferingPolicy: Sendable, Equatable {
     public static let `default`: Self = .boundedFailing(1_024)
 }
 
+/// A failure of an individual event subscription; the transport remains connected.
+public enum CodexSubscriptionError: Error, Sendable, Equatable, LocalizedError {
+    case bufferOverflow
+    public var errorDescription: String? { "subscriber buffer overflow" }
+}
+
 public struct CodexSubscription: Sendable {
     public let id: UUID
     public let events: AsyncThrowingStream<CodexEvent, Error>

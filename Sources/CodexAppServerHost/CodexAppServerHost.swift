@@ -1,7 +1,6 @@
 #if os(macOS)
 @preconcurrency import Foundation
 import Darwin
-import Network
 import CodexAppServerKit
 
 public struct CodexCLIVersion: Sendable, Comparable, CustomStringConvertible {
@@ -110,7 +109,7 @@ public enum CodexHostTransports {
     public static func sshForward(sshURL: URL = URL(fileURLWithPath: "/usr/bin/ssh"), host: CodexSSHHost, localPort: Int, remotePort: Int, remoteHost: String = "127.0.0.1", path: String = "/", bearer: (any CodexBearerCredentialProvider)? = nil) throws -> CodexTransportFactory {
         guard (1...65535).contains(localPort), (1...65535).contains(remotePort) else { throw CodexError.invalidConfiguration("SSH forwarding requires explicit valid local and remote ports") }
         let args = try CodexSSHArguments.build(host: host, remoteArguments: [])
-        let insertion = ["-o", "ExitOnForwardFailure=yes", "-N", "-L", "127.0.0.1:\(localPort):\(remoteHost):\(remotePort)"]
+        let insertion = ["-o", "ExitOnForwardFailure=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no", "-o", "ForkAfterAuthentication=no", "-N", "-L", "127.0.0.1:\(localPort):\(remoteHost):\(remotePort)"]
         guard let marker = args.firstIndex(of: "--") else { throw CodexError.invalidConfiguration("Invalid SSH argument construction") }
         let tunnelArguments = Array(args[..<marker]) + insertion + Array(args[marker...])
         let url = URL(string: "ws://127.0.0.1:\(localPort)\(path.hasPrefix("/") ? path : "/" + path)")!
@@ -264,24 +263,35 @@ private actor SSHForwardTransport: CodexTransport {
             let data = handle.availableData
             Task { await self?.receiveStderr(data) }
         }
+        child.terminationHandler = { [weak self] _ in Task { await self?.sshTerminated() } }
         do {
-            try child.run(); process = child
             guard let port = webSocketConfiguration.url.port else { throw CodexError.invalidConfiguration("Missing tunnel port") }
+            // Reject an occupied port without ever connecting or obtaining credentials.
+            // SSH must bind it itself; the PID check below also covers a race after release.
+            try SSHListenerOwnership.requireAvailable(port: port)
+            try child.run(); process = child
             let deadline = ContinuousClock.now + .seconds(30)
             while true {
                 try Task.checkCancellation()
                 guard !closing else { throw CodexError.closing }
                 guard child.isRunning else { throw CodexError.transportClosed("SSH exited: \(String(decoding: stderrTail, as: UTF8.self))") }
-                if await LoopbackProbe.connect(port: port) { break }
+                if SSHListenerOwnership.ownsListener(pid: child.processIdentifier, port: port) { break }
                 guard ContinuousClock.now < deadline else { throw CodexError.transportClosed("SSH tunnel did not become ready") }
                 try await Task.sleep(for: .milliseconds(50))
             }
             try Task.checkCancellation()
             guard !closing, child.isRunning else { throw CodexError.transportClosed("SSH exited during startup") }
-            let transport = try await CodexWebSocketTransport.factory(configuration: webSocketConfiguration).makeTransport()
+            var configuration = webSocketConfiguration
+            if let provider = configuration.applicationBearer {
+                let credential = try await provider.credential()
+                configuration.applicationBearer = SSHForwardBearer(value: credential)
+            }
+            try verifyListener(child, port: port)
+            let transport = try await CodexWebSocketTransport.factory(configuration: configuration).makeTransport()
+            try verifyListener(child, port: port)
             inner = transport
             try await transport.start()
-            guard !closing else { throw CodexError.closing }
+            guard !closing else { await transport.close(); throw CodexError.closing }
             let incoming = transport.incomingFrames, diagnostics = transport.diagnostics
             tasks = [Task { [weak self] in
                 do { for try await frame in incoming { self?.frames.yield(frame) }; self?.frames.finish() }
@@ -303,6 +313,18 @@ private actor SSHForwardTransport: CodexTransport {
         await shutdownTask?.value
         process = nil; frames.finish(); diagnostic.finish()
     }
+    private func verifyListener(_ child: Process, port: Int) throws {
+        try Task.checkCancellation()
+        guard !closing else { throw CodexError.closing }
+        guard child.isRunning, SSHListenerOwnership.ownsListener(pid: child.processIdentifier, port: port) else {
+            throw CodexError.transportClosed("SSH no longer owns the local forwarding port")
+        }
+    }
+    private func sshTerminated() async {
+        guard !closing else { return }
+        frames.finish(throwing: CodexError.transportClosed("SSH exited: \(String(decoding: stderrTail, as: UTF8.self))"))
+        await close()
+    }
     private func receiveStderr(_ data: Data) {
         guard !data.isEmpty else { return }
         stderrTail.append(data)
@@ -320,44 +342,60 @@ private func terminateOwnedProcess(_ child: Process) async {
     await Task.detached { child.waitUntilExit() }.value
 }
 
-/// Each probe is bounded, including cancellation while the listener is still starting.
-private final class LoopbackProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private let connection: NWConnection
-    private var continuation: CheckedContinuation<Bool, Never>?
-    private var completed = false
-    private static let queue = DispatchQueue(label: "codex.ssh.readiness")
-    private init(port: Int) {
-        connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(port))!, using: .tcp)
-    }
-    static func connect(port: Int) async -> Bool {
-        let probe = LoopbackProbe(port: port)
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in probe.start(continuation) }
-        } onCancel: { probe.finish(false) }
-    }
-    private func start(_ continuation: CheckedContinuation<Bool, Never>) {
-        let cancelled = lock.withLock {
-            guard !completed else { return true }
-            self.continuation = continuation
-            return false
+/// Credentials are resolved before the final listener ownership check.
+private struct SSHForwardBearer: CodexBearerCredentialProvider {
+    let value: CodexBearerCredential
+    func credential() -> CodexBearerCredential { value }
+}
+
+/// Never use a connection to an arbitrary loopback listener as proof of SSH readiness.
+private enum SSHListenerOwnership {
+    static func requireAvailable(port: Int) throws {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw CodexError.transportClosed("Could not allocate SSH forwarding socket") }
+        defer { Darwin.close(descriptor) }
+        // Permit reconnect after TIME_WAIT, but never share an active listener.
+        var reuse: Int32 = 1
+        guard setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout.size(ofValue: reuse))) == 0 else {
+            throw CodexError.transportClosed("Could not configure SSH forwarding socket")
         }
-        guard !cancelled else { continuation.resume(returning: false); return }
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state { case .ready: self?.finish(true); case .failed, .waiting, .cancelled: self?.finish(false); default: break }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = UInt16(port).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
         }
-        connection.start(queue: Self.queue)
-        Self.queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.finish(false) }
+        guard result == 0, Darwin.listen(descriptor, 1) == 0 else { throw CodexError.transportClosed("SSH local forwarding port \(port) is unavailable") }
     }
-    private func finish(_ ready: Bool) {
-        let receiver = lock.withLock {
-            guard !completed else { return Optional<CheckedContinuation<Bool, Never>>.none }
-            completed = true
-            let receiver = continuation; continuation = nil
-            return receiver
+
+    static func ownsListener(pid: Int32, port: Int) -> Bool {
+        let required = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+        guard required > 0 else { return false }
+        let stride = MemoryLayout<proc_fdinfo>.stride
+        // Leave room for descriptors opened between the size query and enumeration.
+        var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(required) / stride + 32)
+        let bytes = descriptors.withUnsafeMutableBytes {
+            proc_pidinfo(pid, PROC_PIDLISTFDS, 0, $0.baseAddress, Int32($0.count))
         }
-        connection.cancel()
-        receiver?.resume(returning: ready)
+        guard bytes > 0, Int(bytes) % stride == 0 else { return false }
+        for descriptor in descriptors.prefix(Int(bytes) / stride) where descriptor.proc_fdtype == PROX_FDTYPE_SOCKET {
+            var info = socket_fdinfo()
+            let size = MemoryLayout<socket_fdinfo>.size
+            guard proc_pidfdinfo(pid, descriptor.proc_fd, PROC_PIDFDSOCKETINFO, &info, Int32(size)) == size else { continue }
+            let socket = info.psi
+            guard socket.soi_family == AF_INET, socket.soi_kind == SOCKINFO_TCP else { continue }
+            let tcp = socket.soi_proto.pri_tcp
+            if tcp.tcpsi_state == TSI_S_LISTEN,
+               tcp.tcpsi_ini.insi_lport == Int32(UInt16(port).bigEndian),
+               tcp.tcpsi_ini.insi_laddr.ina_46.i46a_addr4.s_addr == inet_addr("127.0.0.1") {
+                return true
+            }
+        }
+        return false
     }
 }
 #endif

@@ -38,7 +38,7 @@ final class CodexEventBuffer: @unchecked Sendable {
             }
             // Never discard incremental content or reorder events to make room.
             ended = true
-            failure = CodexError.transportClosed("subscriber buffer overflow")
+            failure = CodexSubscriptionError.bufferOverflow
             terminated = true
             return false
         }
