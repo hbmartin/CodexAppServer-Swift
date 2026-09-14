@@ -21,9 +21,9 @@ let package = Package(
         // SDK's public surface, and it needs only CodexAppServerKit's public API.
         .target(name: "CodexAppServerTestSupport", dependencies: ["CodexAppServerKit"]),
         .testTarget(name: "CodexAppServerKitTests", dependencies: ["CodexAppServerKit", "CodexAppServerTestSupport"]),
-        .testTarget(name: "CodexAppServerHostTests", dependencies: ["CodexAppServerHost", "CodexAppServerKit", "CodexAppServerTestSupport"]),
+        .testTarget(name: "CodexAppServerHostTests", dependencies: ["CodexAppServerHost", "CodexAppServerKit"]),
         .testTarget(name: "CodexAppServerObservationTests", dependencies: ["CodexAppServerObservation", "CodexAppServerKit", "CodexAppServerTestSupport"]),
-        .testTarget(name: "CodexAppServerRemoteExperimentalTests", dependencies: ["CodexAppServerRemoteExperimental", "CodexAppServerKit", "CodexAppServerTestSupport"]),
+        .testTarget(name: "CodexAppServerRemoteExperimentalTests", dependencies: ["CodexAppServerRemoteExperimental", "CodexAppServerKit"]),
         .testTarget(name: "CodexAppServerCLITests", dependencies: ["CodexAppServerCLI", "CodexAppServerKit"]),
     ],
     swiftLanguageModes: [.v6]

@@ -64,8 +64,10 @@ import CodexAppServerTestSupport
     let token = publishers.threads.sink { latest = $0 }
     let first = try CodexThread(raw: ["id": "t", "name": "first"])
     let second = try CodexThread(raw: ["id": "t", "name": "second"])
-    publishers.publishThreads([first, second])
-    #expect(latest.count == 2)
+    let other = try CodexThread(raw: ["id": "other"])
+    publishers.publishThreads([first, other, second])
+    #expect(latest.map(\.id) == ["t", "other"])
+    #expect(latest.first?.name == "second")
     token.cancel()
 }
 
@@ -97,14 +99,20 @@ import CodexAppServerTestSupport
     let client = try await CodexClient.connectedTestClient(transport)
     let publishers = CodexCombinePublishers()
     var emissions = 0
+    var processed = false
     let token = publishers.threads.sink { _ in emissions += 1 }
+    let acknowledgement = publishers.events.sink { event in
+        if case .notification(let method, _) = event, method == "thread/updated" { processed = true }
+    }
     await publishers.observe(client)
 
     try await transport.inject(["method": "thread/updated", "params": ["thread": ["name": "no id"]]])
-    try await Task.sleep(for: .milliseconds(50))
+    // The same MainActor loop emits events and reduces threads without an intervening await.
+    for _ in 0 ..< 1_000 where !processed { try await Task.sleep(for: .milliseconds(2)) }
+    try #require(processed, "the observer must process the malformed notification")
     #expect(emissions == 0)
 
-    publishers.stopObserving(); token.cancel(); await client.close()
+    publishers.stopObserving(); token.cancel(); acknowledgement.cancel(); await client.close()
 }
 
 // MARK: - CodexConversationCollectionModel
@@ -144,9 +152,9 @@ import CodexAppServerTestSupport
     try await model.refresh(using: client)
     #expect(model.conversations.count == 1)
 
-    // A malformed page must not silently empty the model.
-    await transport.setResults(["thread/list": ["data": [["name": "no id"]]]])
-    await #expect(throws: CodexError.missingField("thread.id")) { try await model.refresh(using: client) }
+    // A request failure must preserve the previous collection.
+    await client.close()
+    await #expect(throws: CodexError.self) { try await model.refresh(using: client) }
     #expect(model.conversations.count == 1)
 
     await client.close()

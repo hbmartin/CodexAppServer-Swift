@@ -125,3 +125,59 @@ private struct StaticCredentials: WHAMCredentialProvider {
     let factory = await controller.transportFactory(hostID: "unknown-host")
     await #expect(throws: CodexError.self) { _ = try await factory.makeTransport() }
 }
+
+private actor RecordingGrantStore: WHAMPairingGrantStore {
+    private var values: [String: WHAMPairingGrant] = [:]
+    func grant(for hostID: String) -> WHAMPairingGrant? { values[hostID] }
+    func save(_ grant: WHAMPairingGrant) { values[grant.hostID] = grant }
+    func remove(hostID: String) { values.removeValue(forKey: hostID) }
+    func count() -> Int { values.count }
+}
+
+private final class PairingURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "pairing.test" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let raw: JSONValue
+        switch request.url!.lastPathComponent {
+        case "servers": raw = ["servers": [["serverId": "", "hostId": "h"]]]
+        case "empty": raw = ["serverId": "", "hostId": "", "pairingGrant": "test-grant"]
+        case "emptyGrant": raw = ["hostId": "h", "pairingGrant": "", "grant": ""]
+        default: raw = ["serverId": "", "hostId": "h", "pairingGrant": "", "grant": "test-grant"]
+        }
+        do {
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: try raw.encoded())
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() {}
+}
+
+@Test func claimedGrantUsesTheListedHostIdentity() async throws {
+    let store = RecordingGrantStore()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PairingURLProtocol.self]
+    let controller = WHAMController(credentials: StaticCredentials(), grantStore: store,
+                                    endpoints: .init(baseURL: URL(string: "https://pairing.test")!), sessionConfiguration: configuration)
+    let grant = try await controller.claim(WHAMPairingCode("123"))
+    let hosts = try await controller.listPairedHosts()
+    let host = try #require(hosts.first)
+    #expect(host.id == "h")
+    #expect(grant.hostID == host.id)
+    #expect(grant.grant == "test-grant")
+    #expect(await store.grant(for: host.id) == grant)
+    #expect(await store.grant(for: "") == nil)
+}
+
+@Test(arguments: ["empty", "emptyGrant"])
+func invalidClaimDoesNotSaveAGrant(path: String) async throws {
+    let store = RecordingGrantStore()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PairingURLProtocol.self]
+    let controller = WHAMController(credentials: StaticCredentials(), grantStore: store,
+                                    endpoints: .init(baseURL: URL(string: "https://pairing.test")!, claimPath: path), sessionConfiguration: configuration)
+    await #expect(throws: CodexError.self) { try await controller.claim(WHAMPairingCode("123")) }
+    #expect(await store.count() == 0)
+}

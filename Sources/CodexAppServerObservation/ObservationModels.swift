@@ -156,10 +156,14 @@ public final class CodexCombinePublishers {
         }
     }
     /// Replaces the published set. Duplicate IDs keep the last occurrence rather than trapping —
-    /// a server may legitimately repeat a thread across pages.
+    /// a server may legitimately repeat a thread across pages. Order follows each ID's first occurrence.
     public func publishThreads(_ values: [CodexThread]) {
         knownThreads = Dictionary(values.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
-        threads.send(values)
+        var seen: Set<String> = []
+        threads.send(values.compactMap { thread in
+            guard seen.insert(thread.id).inserted else { return nil }
+            return knownThreads[thread.id]
+        })
     }
     public func stopObserving() { task?.cancel(); task = nil }
 }

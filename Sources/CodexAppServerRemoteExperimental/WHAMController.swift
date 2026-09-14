@@ -62,7 +62,8 @@ public actor WHAMController {
     @discardableResult
     public func claim(_ code: WHAMPairingCode) async throws -> WHAMPairingGrant {
         let result = try await request(path: endpoints.claimPath, method: "POST", body: ["pairing_code": .string(code.value), "protocol_version": "2"])
-        guard let hostID = result["serverId"]?.stringValue ?? result["hostId"]?.stringValue, let value = result["pairingGrant"]?.stringValue ?? result["grant"]?.stringValue else { throw CodexError.missingField("serverId/pairingGrant") }
+        let hostID = try WHAMHost(raw: result).id
+        let value = try result.requireString("pairingGrant", "grant", context: "pairing")
         let grant = WHAMPairingGrant(hostID: hostID, environmentID: result["environmentId"]?.stringValue, grant: value); try await grants.save(grant); return grant
     }
     public func listPairedHosts() async throws -> [WHAMHost] {

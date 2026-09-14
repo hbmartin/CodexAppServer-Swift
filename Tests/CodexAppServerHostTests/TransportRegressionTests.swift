@@ -6,6 +6,33 @@ import CodexAppServerHost
 import Darwin
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["RUN_CODEX_PROCESS_TESTS"] == "1"))
+func directoryListingIdentifiesRealServerSymlinks() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let workspace = directory.appendingPathComponent("workspace")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    let file = workspace.appendingPathComponent("plain.txt")
+    try Data("content".utf8).write(to: file)
+    try FileManager.default.createSymbolicLink(at: workspace.appendingPathComponent("link.txt"), withDestinationURL: file)
+    let environment = ProcessInfo.processInfo.environment.merging(["CODEX_HOME": directory.path]) { _, new in new }
+    let factory = CodexHostTransports.isolated(executableURL: try CodexCLIResolver().resolve(), environment: environment)
+    let client = CodexClient(transportFactory: factory, configuration: .init(requestTimeout: .seconds(5), reconnectPolicy: .init(maximumAttempts: 0)))
+    do {
+        _ = try await client.connect()
+        let entries = try await client.listDirectory(path: workspace.path, roots: .init([workspace]))
+        #expect(entries.count == 2)
+        #expect(entries.first { $0.name == "link.txt" }?.isSymlink == true)
+        #expect(entries.first { $0.name == "plain.txt" }?.isSymlink == false)
+        #expect(entries.allSatisfy { $0.raw["isSymlink"] == nil })
+    } catch {
+        await client.close()
+        throw error
+    }
+    await client.close()
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["RUN_CODEX_PROCESS_TESTS"] == "1"))
 func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

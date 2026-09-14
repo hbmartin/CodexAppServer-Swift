@@ -56,14 +56,16 @@ fi
 # The slice is delimited by two anchors. Both must exist: a `sed` range whose end pattern is
 # missing silently runs to end of file, which would quietly widen the slice instead of failing.
 notification_anchors_ok=1
-for anchor in 'private func routeNotification(' 'private func routeServerRequest('; do
-    grep -qF "$anchor" "$sources_dir/CodexClient.swift" || {
+notification_start='^[[:space:]]*private func routeNotification[(]'
+notification_end='^[[:space:]]*private func routeServerRequest[(]'
+for anchor in "$notification_start" "$notification_end"; do
+    grep -qE "$anchor" "$sources_dir/CodexClient.swift" || {
         fail "notifications: anchor \"$anchor\" not found in CodexClient.swift — was it renamed?"
         notification_anchors_ok=0
     }
 done
 
-sed -n '/private func routeNotification/,/^    private func routeServerRequest/p' "$sources_dir/CodexClient.swift" \
+sed -nE "/$notification_start/,/$notification_end/p" "$sources_dir/CodexClient.swift" \
     | grep -o '"[^"]*"' | tr -d '"' | grep '/' | sort -u > "$work_dir/sdk-notifications"
 jq -r '.oneOf[].properties.method.enum[0] // empty' "$snapshot_dir/ServerNotification.json" \
     | sort -u > "$work_dir/schema-notifications"

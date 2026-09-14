@@ -6,22 +6,25 @@ import CodexAppServerKit
 /// Used to hold a transport inside `start()` or inside a chosen request so the test can act
 /// while the client is mid-flight.
 public actor CodexTestGate {
-    private var waiting = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
 
     public init() {}
 
-    /// True once something is parked on this gate.
-    public func isWaiting() -> Bool { waiting }
+    /// True while at least one waiter is parked on this gate.
+    public func isWaiting() -> Bool { !continuations.isEmpty }
 
     public func wait() async {
-        waiting = true
-        await withCheckedContinuation { continuation = $0 }
+        guard !released else { return }
+        await withCheckedContinuation { continuations.append($0) }
     }
 
+    /// Opens the gate permanently, including for waits that start after this call.
     public func release() {
-        continuation?.resume()
-        continuation = nil
+        released = true
+        let waiting = continuations
+        continuations.removeAll()
+        for continuation in waiting { continuation.resume() }
     }
 }
 
@@ -37,6 +40,8 @@ public actor CodexTransportSequence {
         return transports.removeFirst()
     }
 
+    public func remainingCount() -> Int { transports.count }
+
     /// A factory that draws from this sequence, for tests that exercise reconnects.
     public nonisolated var factory: CodexTransportFactory {
         .init { try await self.next() }
@@ -47,7 +52,7 @@ public actor CodexTransportSequence {
 /// app-server.
 ///
 /// Requests are matched by JSON-RPC method: `results[method]` is returned as the result, or an
-/// empty object when the method is absent. `defaultResults` supplies a small scripted server
+/// empty object when absent (except thread/read and thread/resume, which echo the ID). `defaultResults` supplies a small scripted server
 /// covering the common handshake and thread operations.
 ///
 /// The fault-injection knobs each model a failure the SDK has to survive: a slow responder, a
@@ -63,6 +68,8 @@ public actor CodexScriptedTransport: CodexTransport {
     private var sent: [JSONValue] = []
     private var results: [String: JSONValue]
     private var closedFlag = false
+    private let ignoredMethods: Set<String>
+    private let requestHandler: (@Sendable (JSONValue) throws -> JSONValue?)?
 
     private var delayResponses: Bool
     private var replayOnResume: Bool
@@ -82,11 +89,16 @@ public actor CodexScriptedTransport: CodexTransport {
     ]
 
     /// - Parameters:
-    ///   - results: per-method results. Methods not present answer with an empty object.
+    ///   - results: per-method results, overriding the thread/read and thread/resume ID echo.
+    ///   - ignoredMethods: requests recorded but never answered, for timeout and cancellation tests.
+    ///   - requestHandler: optional parameter-aware result override; nil falls back to the table.
     ///   - delayResponses: sleep 50 ms before answering a client *response* frame.
     ///   - replayOnResume: inject a server request during `thread/resume`, as an app-server
     ///     does when it replays an unanswered approval after a reconnect.
-    public init(results: [String: JSONValue] = [:], delayResponses: Bool = false, replayOnResume: Bool = false) {
+    public init(results: [String: JSONValue] = [:], delayResponses: Bool = false, replayOnResume: Bool = false,
+                ignoredMethods: Set<String> = [], requestHandler: (@Sendable (JSONValue) throws -> JSONValue?)? = nil) {
+        self.ignoredMethods = ignoredMethods
+        self.requestHandler = requestHandler
         self.results = results
         self.delayResponses = delayResponses
         self.replayOnResume = replayOnResume
@@ -97,8 +109,8 @@ public actor CodexScriptedTransport: CodexTransport {
     }
 
     /// A transport preloaded with ``defaultResults``, merged with `overrides`.
-    public static func scripted(overrides: [String: JSONValue] = [:]) -> CodexScriptedTransport {
-        CodexScriptedTransport(results: defaultResults.merging(overrides) { _, override in override })
+    public static func scripted(overrides: [String: JSONValue] = [:], ignoredMethods: Set<String> = []) -> CodexScriptedTransport {
+        CodexScriptedTransport(results: defaultResults.merging(overrides) { _, override in override }, ignoredMethods: ignoredMethods)
     }
 
     // MARK: - CodexTransport
@@ -115,12 +127,19 @@ public actor CodexScriptedTransport: CodexTransport {
         if message["result"] != nil, rejectResponses { throw CodexError.transportClosed("ambiguous send failure") }
         if message["result"] != nil, delayResponses { try await Task.sleep(for: .milliseconds(50)) }
         guard let id = message["id"], let method = message["method"]?.stringValue else { return }
+        if ignoredMethods.contains(method) { return }
         if let methodGate, methodGate.method == method { await methodGate.gate.wait() }
         if method == "thread/resume", replayOnResume {
             try inject(["id": 55, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
             try await Task.sleep(for: .milliseconds(100))
         }
-        try inject(["id": id, "result": results[method] ?? .object([:])])
+        let result: JSONValue
+        if let handled = try requestHandler?(message) { result = handled }
+        else if let configured = results[method] { result = configured }
+        else if method == "thread/resume" || method == "thread/read" {
+            result = ["thread": ["id": message["params"]?["threadId"] ?? "thread-1"]]
+        } else { result = .object([:]) }
+        try inject(["id": id, "result": result])
     }
 
     public func close() {
@@ -162,9 +181,9 @@ public actor CodexScriptedTransport: CodexTransport {
     public func messages() -> [JSONValue] { sent }
     public func isClosed() -> Bool { closedFlag }
 
-    /// The JSON-RPC id the client used for the first request with this method.
+    /// The JSON-RPC id the client used for the most recent request with this method.
     public func requestID(method: String) -> JSONValue? {
-        sent.first { $0["method"]?.stringValue == method }?["id"]
+        sent.last { $0["method"]?.stringValue == method }?["id"]
     }
 
     /// A factory that always returns this transport.

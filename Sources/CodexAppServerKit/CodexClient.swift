@@ -315,18 +315,30 @@ public actor CodexClient {
     /// Decodes on the reducer path, where a malformed frame must be reported and dropped rather
     /// than thrown: a bad notification cannot be allowed to fail an unrelated caller's in-flight
     /// request or tear down the connection.
-    private func decodeOrReport<T>(_ method: String, _ make: () throws -> T) -> T? {
+    private func decodeOrReport<T>(_ method: String, threadID: String? = nil, _ make: () throws -> T) -> T? {
         do { return try make() }
-        catch CodexError.missingField(let field) { emit(malformed(method, "missing \(field)")); return nil }
-        catch { emit(malformed(method, error.localizedDescription)); return nil }
+        catch CodexError.missingField(let field) { emit(malformed(method, "missing \(field)", threadID: threadID)); return nil }
+        catch { emit(malformed(method, error.localizedDescription, threadID: threadID)); return nil }
     }
 
-    private func malformed(_ method: String, _ reason: String) -> CodexEvent {
-        .diagnostic(.malformedMessage("\(method): \(reason)"))
+    func malformed(_ method: String, _ reason: String, threadID: String? = nil) -> CodexEvent {
+        let message = "\(method): \(reason)"
+        if let threadID, !threadID.isEmpty {
+            return .diagnostic(.threadMalformedMessage(threadID: threadID, message: message))
+        }
+        return .diagnostic(.malformedMessage(message))
     }
 
     private func routeNotification(method: String, params: JSONValue) {
         let threadID = params["threadId"]?.stringValue ?? params["thread"]?["id"]?.stringValue
+        let requiresThreadID: Set<String> = [
+            "item/started", "item/completed", "turn/started", "turn/completed", "thread/tokenUsage/updated",
+            "item/agentMessage/delta", "item/plan/delta", "item/reasoning/textDelta",
+            "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+        ]
+        if requiresThreadID.contains(method), threadID?.isEmpty != false {
+            emit(malformed(method, "missing or empty params.threadId")); return
+        }
         if method == "serverRequest/resolved" {
             if let id = params["requestId"] { pendingInteractionIDs.remove(id) }
             emit(.serverRequestResolved(params)); return
@@ -343,21 +355,21 @@ public actor CodexClient {
         if method == "fuzzyFileSearch/sessionUpdated" { emit(.fileSearchUpdated(params)); return }
         if method == "fuzzyFileSearch/sessionCompleted" { emit(.fileSearchCompleted(params)); return }
         if method == "item/started", let raw = params["item"] {
-            guard let item = decodeOrReport(method, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
+            guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
             reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
         }
         if method == "item/completed", let raw = params["item"] {
-            guard let item = decodeOrReport(method, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
+            guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
             reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
         }
         if method == "turn/started", let raw = params["turn"] {
             guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
-            guard let turn = decodeOrReport(method, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
+            guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
             reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
         }
         if method == "turn/completed", let raw = params["turn"] {
             guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
-            guard let turn = decodeOrReport(method, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
+            guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
             reduceTurn(turn, completed: true); emit(.turnCompleted(threadID: threadID, turn: turn)); return
         }
         let itemDeltaMethods: Set<String> = [
@@ -434,7 +446,7 @@ public actor CodexClient {
     }
 
     private func reduceItem(_ item: CodexItem, threadID: String?, authoritative: Bool) {
-        guard let threadID else { return }
+        guard let threadID, !threadID.isEmpty else { return }
         var state = threadStates[threadID] ?? .init()
         if state.items[item.id] == nil { state.itemOrder.append(item.id) }
         if authoritative || state.items[item.id] == nil { state.items[item.id] = item }
@@ -471,7 +483,7 @@ public actor CodexClient {
         }
         threadStates[thread.id] = snapshot
         // Report the caveat before the snapshot it qualifies.
-        if skipped > 0 { emit(malformed("thread/history", "skipped \(skipped) malformed turns/items")) }
+        if skipped > 0 { emit(malformed("thread/history", "skipped \(skipped) malformed turns/items", threadID: thread.id)) }
         emit(.threadStateUpdated(threadID: thread.id, state: snapshot))
     }
 

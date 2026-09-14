@@ -3,6 +3,7 @@ import Foundation
 public enum CodexDiagnostic: Sendable, Equatable {
     case transport(CodexTransportDiagnostic), malformedMessage(String), unmatchedResponse(JSONValue)
     case slowSubscriber(UUID), highThreadSubscriptionCount(Int), reconnectFailed(attempt: Int, message: String)
+    case threadMalformedMessage(threadID: String, message: String)
     case raw(String, JSONValue)
 }
 public enum CodexEvent: Sendable, Equatable {
@@ -24,6 +25,7 @@ public enum CodexEvent: Sendable, Equatable {
         case .itemStarted(let id, _), .itemDelta(let id, _, _, _), .itemCompleted(let id, _), .turnStarted(let id, _), .turnCompleted(let id, _): id
         case .serverRequest(let request): request.threadID
         case .threadStateUpdated(let id, _): id
+        case .diagnostic(.threadMalformedMessage(let id, _)): id
         case .serverRequestResolved(let params): params["threadId"]?.stringValue
         case .notification(_, let params): params["threadId"]?.stringValue ?? params["thread"]?["id"]?.stringValue
         default: nil

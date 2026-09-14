@@ -32,9 +32,9 @@ public struct CodexTurn: CodexRawModel, Identifiable {
     /// Validated at initialization, so it is never empty.
     public let id: String
     public var status: String? { raw["status"]?.stringValue }
-    /// - Throws: `CodexError.missingField` when `threadID` is empty or `raw` carries no usable `id`.
+    /// - Throws: `CodexError.invalidArgument` for an empty `threadID`, or `CodexError.missingField` for an unusable `id`.
     public init(threadID: String, raw: JSONValue) throws {
-        guard !threadID.isEmpty else { throw CodexError.missingField("turn.threadId") }
+        guard !threadID.isEmpty else { throw CodexError.invalidArgument("threadID must not be empty") }
         self.threadID = threadID; self.id = try raw.requireString("id", context: "turn"); self.raw = raw
     }
 }

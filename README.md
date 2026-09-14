@@ -182,6 +182,14 @@ Use `${NAME}` in the URL, header values, or JSON string values to load secrets f
 
 Delivery does not block Codex event processing and is not retried. HTTP 2xx is considered successful. Other responses and transport failures produce a sanitized stderr message without printing the URL, headers, body, or resolved secrets, and do not stop the interactive session. The CLI waits for requests already in progress before exiting, subject to each request's configured timeout.
 
+## Decoding and retries
+
+Typed list methods retain valid entries and pagination cursors when individual entries are malformed. They report skipped entries through diagnostics; history replay uses the same policy. Diagnostics tied to a known thread also reach `events(for:)` subscribers. Whole-object reads still throw for invalid required fields. Empty identity arguments fail locally with `CodexError.invalidArgument` before a request is sent.
+
+`startThread`, `forkThread`, `startTurn`, and `steerTurn` throw `CodexError.invalidMutationResponse` if the server acknowledges the operation but its result cannot be decoded. The error includes the method and raw response for reconciliation. The operation may already have taken effect: inspect the server's thread/turn state before deciding whether to retry. Timeouts, cancellation, and transport failures can also leave delivery uncertain. The SDK does not automatically retry these mutations.
+
+Directory listings obtain each child's symlink flag using `fs/getMetadata`, since the pinned `fs/readDirectory` entry schema does not include it. This requires one additional metadata request per child.
+
 ## Logging, tests, and schema drift
 
 Structured logging is silent by default and accepts an application sink. Payloads are redacted by default. Full-payload mode may include prompts, paths, commands, and output; credential-shaped fields remain redacted in all modes.
@@ -194,7 +202,7 @@ Scripts/check-schema-drift.sh             # has upstream moved away from the sna
 
 The reviewed CLI 0.146.0 snapshot is in `Schemas/0.146.0`. CI regenerates it with the pinned CLI and fails on any difference, builds macOS 15 and iOS 26, enforces Swift 6 strict concurrency, builds DocC for every library target, and compares API compatibility against the latest 0.2.x tag. A weekly job additionally audits the snapshot against `codex@latest` as an early warning that upstream has moved.
 
-`Scripts/check-schema-drift.sh` also checks the SDK against the snapshot, not just the snapshot against upstream: every method the SDK sends must exist in `ClientRequest.json`, every notification method it routes must exist in `ServerNotification.json`, and `CodexItemKind` must still match the `ThreadItem` discriminator. A removed case fails; a new upstream case only warns, because unknown values already degrade through `.unknown`.
+`Scripts/check-sdk-schema-conformance.sh` checks the SDK against the pinned snapshot: every method the SDK sends must exist in `ClientRequest.json`, every notification method it routes must exist in `ServerNotification.json`, and `CodexItemKind` must still match the `ThreadItem` discriminator. An SDK case absent from the snapshot warns; a snapshot case missing from the SDK fails. Drift against a newer upstream schema is checked separately by `check-schema-drift.sh`.
 
 Authenticated local tests are opt-in. Any test that starts a model turn must set an explicit Luna model and fails closed otherwise:
 
