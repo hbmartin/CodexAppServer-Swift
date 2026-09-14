@@ -18,6 +18,16 @@ for function_name in routeNotification routeServerRequest; do
     bash "$check" > "$test_dir/output"
 done
 
+cp "$client" "$test_dir/client-with-anchors.swift"
+sed 's/"item\/started", "item\/completed"/"unknownSlashFree", "item\/started", "item\/completed"/' "$client" > "$test_dir/client.swift"
+mv "$test_dir/client.swift" "$client"
+if bash "$check" > "$test_dir/output"; then
+    echo 'FAIL: unknown slash-free notification method was accepted' >&2
+    exit 1
+fi
+grep -q 'unknownSlashFree' "$test_dir/output"
+cp "$test_dir/client-with-anchors.swift" "$client"
+
 sed 's/private func routeServerRequest(/private func renamedServerRequest(/' "$client" > "$test_dir/client.swift"
 mv "$test_dir/client.swift" "$client"
 if bash "$check" > "$test_dir/output"; then

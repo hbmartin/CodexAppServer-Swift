@@ -18,7 +18,7 @@ import CodexAppServerHost
     _ = try await first.connect(); _ = try await second.connect()
     let thread = try await first.startThread(options: .init(model: model))
     _ = try await second.subscribeThread(id: thread.id)
-    let events = await second.events(for: thread.id, policy: .unbounded)
+    let events = try await second.events(for: thread.id, policy: .unbounded)
     let turn = try await first.startTurn(threadID: thread.id, prompt: "Reply with exactly OK.", options: .init(model: model))
     var iterator = events.events.makeAsyncIterator(), observed = false
     for _ in 0..<500 {

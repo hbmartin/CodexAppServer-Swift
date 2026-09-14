@@ -10,10 +10,6 @@
 # Every check below is green at the time it was written; a failure means a real divergence,
 # not a tightening of the rules.
 #
-# Known limitation: check (b) recognises notification methods by the "/" in them. A future
-# slash-free method (the schema already has "error", "warning", "configWarning") would be
-# skipped. That is a false negative, never a false positive.
-
 set -uo pipefail   # deliberately not -e: report every failure, then exit once.
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -66,7 +62,15 @@ for anchor in "$notification_start" "$notification_end"; do
 done
 
 sed -nE "/$notification_start/,/$notification_end/p" "$sources_dir/CodexClient.swift" \
-    | grep -o '"[^"]*"' | tr -d '"' | grep '/' | sort -u > "$work_dir/sdk-notifications"
+    > "$work_dir/notification-route"
+
+# Extract operands from direct `method == "..."` conditions and the Set<String> collections
+# passed to `contains(method)`. Method spelling is irrelevant, so slash-free methods are kept.
+{
+    grep -oE 'method[[:space:]]*==[[:space:]]*"[^"]*"' "$work_dir/notification-route"
+    sed -nE '/^[[:space:]]*(let|var)[^:]+:[[:space:]]*Set<String>[[:space:]]*=[[:space:]]*\[/,/^[[:space:]]*\]/p' \
+        "$work_dir/notification-route"
+} | grep -o '"[^"]*"' | tr -d '"' | sort -u > "$work_dir/sdk-notifications"
 jq -r '.oneOf[].properties.method.enum[0] // empty' "$snapshot_dir/ServerNotification.json" \
     | sort -u > "$work_dir/schema-notifications"
 

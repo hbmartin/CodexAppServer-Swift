@@ -267,7 +267,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
 
 @Test func reviewItemLifecycleRetainsOwningTurn() async throws {
     let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
-    let subscription = await client.events(for: "t", policy: .unbounded)
+    let subscription = try await client.events(for: "t", policy: .unbounded)
     var iterator = subscription.events.makeAsyncIterator()
     for method in ["item/started", "item/completed"] {
         try await transport.inject(["method": .string(method), "params": ["threadId": "t", "turnId": "u", "item": ["id": "i", "type": "agentMessage"]]])

@@ -55,12 +55,32 @@ import CodexAppServerTestSupport
     await client.close()
 }
 
+@Test func eventSubscriptionsRejectEmptyThreadIDsAndAcceptNilOrNonEmptyIDs() async throws {
+    let transport = CodexScriptedTransport()
+    let client = try await CodexClient.connectedTestClient(transport)
+    await #expect(throws: CodexError.invalidArgument("threadID must not be empty")) {
+        _ = try await client.events(for: "")
+    }
+
+    let global = try await client.events(for: nil, policy: .unbounded)
+    let thread = try await client.events(for: "t", policy: .unbounded)
+    let params: JSONValue = ["threadId": "t", "value": true]
+    try await transport.inject(["method": "test/notification", "params": params])
+    var globalIterator = global.events.makeAsyncIterator()
+    var threadIterator = thread.events.makeAsyncIterator()
+    let expected = CodexEvent.notification(method: "test/notification", params: params)
+    #expect(try await globalIterator.next() == expected)
+    #expect(try await threadIterator.next() == expected)
+
+    global.cancel(); thread.cancel(); await client.close()
+}
+
 // MARK: - Notification path: reported, dropped, and otherwise harmless
 
 @Test func malformedItemNotificationIsDiagnosedWithoutFailingLaterRequests() async throws {
     let transport = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
     let client = try await CodexClient.connectedTestClient(transport)
-    let subscription = await client.events(for: "t", policy: .unbounded)
+    let subscription = try await client.events(for: "t", policy: .unbounded)
 
     try await transport.inject(["method": "item/started", "params": ["threadId": "t", "item": ["type": "agentMessage"]]])
 
@@ -120,7 +140,7 @@ import CodexAppServerTestSupport
     ]]]
     let transport = CodexScriptedTransport(results: ["thread/read": history, "thread/resume": history])
     let client = try await CodexClient.connectedTestClient(transport)
-    let subscription = await client.events(for: "t", policy: .unbounded)
+    let subscription = try await client.events(for: "t", policy: .unbounded)
 
     _ = try await client.readThread(id: "t", includeTurns: true)
 
@@ -161,9 +181,42 @@ import CodexAppServerTestSupport
     let entries = try await client.listDirectory(path: "/tmp/workspace", roots: .init([root]))
     #expect(entries.count == 2)
     let metadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(metadataPaths == ["/tmp/workspace", "/tmp/workspace/plain.txt", "/tmp/workspace/link.txt"])
+    #expect(metadataPaths.first == "/tmp/workspace")
+    #expect(Set(metadataPaths.dropFirst()) == ["/tmp/workspace/plain.txt", "/tmp/workspace/link.txt"])
     #expect(entries.first(where: { $0.name == "link.txt" })?.isSymlink == true)
     #expect(entries.first(where: { $0.name == "plain.txt" })?.isSymlink == false)
+    await client.close()
+}
+
+@Test func directoryMetadataRequestsAreBoundedAndResultsPreserveChildOrder() async throws {
+    let root = URL(fileURLWithPath: "/tmp/workspace")
+    let names = (0..<10).map { "child-\($0)" }
+    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false] })])
+    let transport = CodexScriptedTransport(results: ["fs/readDirectory": listing], requestHandler: { request in
+        guard request["method"] == "fs/getMetadata" else { return nil }
+        return ["isDirectory": false, "isFile": true, "isSymlink": false]
+    })
+    let client = try await CodexClient.connectedTestClient(transport)
+    let directoryGate = CodexTestGate(), metadataGate = CodexTestGate()
+    await transport.hold(method: "fs/readDirectory", at: directoryGate)
+    let listingTask = Task { try await client.listDirectory(path: root.path, roots: .init([root])) }
+
+    for _ in 0..<1_000 {
+        if await directoryGate.waiterCount() == 1 { break }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(await directoryGate.waiterCount() == 1)
+    await transport.hold(method: "fs/getMetadata", at: metadataGate)
+    await directoryGate.release()
+    for _ in 0..<1_000 {
+        if await metadataGate.waiterCount() == 8 { break }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(await metadataGate.waiterCount() == 8)
+    await metadataGate.release()
+
+    let entries = try await listingTask.value
+    #expect(entries.map(\.name) == names)
     await client.close()
 }
 
@@ -173,7 +226,7 @@ func malformedHistoryPageStillAllowsFetchingNextPage(method: String) async throw
     let raw: JSONValue = ["data": [.object([:]), valid], "nextCursor": "next"]
     let transport = CodexScriptedTransport(results: [method: raw])
     let client = try await CodexClient.connectedTestClient(transport)
-    let subscription = await client.events(for: "t", policy: .unbounded)
+    let subscription = try await client.events(for: "t", policy: .unbounded)
     if method == "thread/turns/list" {
         let page = try await client.listTurns(threadID: "t")
         #expect(page.items.map(\.id) == ["u"])
@@ -274,10 +327,28 @@ func emptyNotificationThreadIDIsDiagnosedWithoutCreatingState(method: String) as
     subscription.cancel(); await client.close()
 }
 
+@Test(arguments: ["item/started", "item/completed", "turn/started", "turn/completed"])
+func lifecycleNotificationWithoutPayloadIsDiagnosedAndDropped(method: String) async throws {
+    let transport = CodexScriptedTransport()
+    let client = try await CodexClient.connectedTestClient(transport)
+    let subscription = try await client.events(for: "t", policy: .unbounded)
+    try await transport.inject(["method": .string(method), "params": ["threadId": "t"]])
+
+    var iterator = subscription.events.makeAsyncIterator()
+    let field = method.hasPrefix("item/") ? "item" : "turn"
+    #expect(try await iterator.next() == .diagnostic(.threadMalformedMessage(
+        threadID: "t",
+        message: "\(method): missing params.\(field)"
+    )))
+    subscription.cancel()
+    #expect(try await iterator.next() == nil, "malformed lifecycle notifications must not reach the raw fallback")
+    await client.close()
+}
+
 @Test func threadDiagnosticsDoNotLeakIntoOtherThreadSubscriptions() async throws {
     let transport = CodexScriptedTransport(results: ["thread/read": ["thread": ["id": "other", "turns": []]]])
     let client = try await CodexClient.connectedTestClient(transport)
-    let subscription = await client.events(for: "other", policy: .unbounded)
+    let subscription = try await client.events(for: "other", policy: .unbounded)
     try await transport.inject(["method": "item/started", "params": ["threadId": "t", "item": ["type": "agentMessage"]]])
     // A subsequent snapshot is an ordered marker on the other thread's stream.
     _ = try await client.readThread(id: "other", includeTurns: true)
