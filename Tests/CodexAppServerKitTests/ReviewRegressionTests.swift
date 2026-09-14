@@ -50,8 +50,8 @@ private func reviewClient(_ transport: ReviewTransport) async throws -> CodexCli
     _ = try await client.connect(); return client
 }
 
-@Test func reviewCommandOutputDecodesProtocolBytes() {
-    let output = CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGVsbG8=", "capReached": false])
+@Test func reviewCommandOutputDecodesProtocolBytes() throws {
+    let output = try CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGVsbG8=", "capReached": false])
     #expect(String(decoding: output.data, as: UTF8.self) == "hello")
 }
 

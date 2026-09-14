@@ -38,8 +38,12 @@ public struct CodexCommandOutput: Sendable, Equatable {
     public var stream: Stream
     public var data: Data
     public var raw: JSONValue
-    public init(raw: JSONValue) {
-        self.raw = raw; processID = raw["processId"]?.stringValue ?? ""
+    /// - Throws: `CodexError.missingField` when `raw` carries no usable `processId`.
+    ///   `processID` demultiplexes streamed output, so an empty one would merge the
+    ///   output of unrelated processes.
+    public init(raw: JSONValue) throws {
+        processID = try raw.requireString("processId", context: "commandOutput")
+        self.raw = raw
         stream = Stream(rawValue: raw["stream"]?.stringValue ?? "") ?? .unknown
         data = Data(base64Encoded: raw["deltaBase64"]?.stringValue ?? "") ?? Data()
     }

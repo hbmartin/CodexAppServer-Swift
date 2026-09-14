@@ -71,7 +71,7 @@ private func makeClient(_ transport: FakeTransport, configuration: CodexClientCo
         "PermissionsRequestApprovalResponse.json", "ToolRequestUserInputResponse.json", "McpServerElicitationRequestResponse.json",
     ]
     for fixture in fixtures { #expect(try JSONValue.decode(Data(contentsOf: schema.appendingPathComponent(fixture))).objectValue != nil) }
-    #expect(CodexItem(raw: ["id": "future", "type": "futureItem", "newField": 1]).kind == .unknown("futureItem"))
+    #expect(try CodexItem(raw: ["id": "future", "type": "futureItem", "newField": 1]).kind == .unknown("futureItem"))
 }
 
 @Test func initializeAlwaysEnablesExperimentalAndFormElicitation() async throws {

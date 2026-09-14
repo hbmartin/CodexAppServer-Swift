@@ -134,7 +134,9 @@ public actor CodexClient {
         let lifetime = CodexEventStreamLifetime(buffer: buffer)
         let stream = AsyncThrowingStream<CodexEvent, Error>(unfolding: { try await lifetime.buffer.next() })
         subscribers[id] = Subscriber(threadID: threadID, buffer: buffer)
-        if let threadID {
+        // An empty thread ID is never a real subscription intent: resuming it on reconnect would
+        // send `"threadId": ""`, and it would match every event whose thread ID is absent.
+        if let threadID, !threadID.isEmpty {
             subscriptionIntents.insert(threadID)
             if subscriptionIntents.count == 9 { emit(.diagnostic(.highThreadSubscriptionCount(subscriptionIntents.count))) }
         }
@@ -294,7 +296,11 @@ public actor CodexClient {
                 let result = message["result"] ?? .null
                 // Reduce in wire order, before waking the caller or reading later notifications.
                 if ["thread/read", "thread/resume", "thread/start", "thread/fork"].contains(entry.method), let raw = result["thread"] {
-                    applyThreadSnapshot(.init(raw: raw), includesTurns: entry.includesHistory)
+                    // Reducer path: diagnose and skip. The caller separately learns about the same
+                    // malformed object because its own CodexThread(raw:) throws.
+                    if let thread = decodeOrReport(entry.method, { try CodexThread(raw: raw) }) {
+                        applyThreadSnapshot(thread, includesTurns: entry.includesHistory)
+                    }
                 }
                 entry.continuation.resume(returning: result)
             }
@@ -304,6 +310,19 @@ public actor CodexClient {
         let params = message["params"] ?? .object([:])
         if let requestID = message["id"] { await routeServerRequest(id: requestID, method: method, params: params) }
         else { routeNotification(method: method, params: params) }
+    }
+
+    /// Decodes on the reducer path, where a malformed frame must be reported and dropped rather
+    /// than thrown: a bad notification cannot be allowed to fail an unrelated caller's in-flight
+    /// request or tear down the connection.
+    private func decodeOrReport<T>(_ method: String, _ make: () throws -> T) -> T? {
+        do { return try make() }
+        catch CodexError.missingField(let field) { emit(malformed(method, "missing \(field)")); return nil }
+        catch { emit(malformed(method, error.localizedDescription)); return nil }
+    }
+
+    private func malformed(_ method: String, _ reason: String) -> CodexEvent {
+        .diagnostic(.malformedMessage("\(method): \(reason)"))
     }
 
     private func routeNotification(method: String, params: JSONValue) {
@@ -317,20 +336,29 @@ public actor CodexClient {
             snapshot.tokenUsage = params["tokenUsage"]
             threadStates[threadID] = snapshot
         }
-        if method == "command/exec/outputDelta" { emit(.commandOutput(.init(raw: params))); return }
+        if method == "command/exec/outputDelta" {
+            guard let output = decodeOrReport(method, { try CodexCommandOutput(raw: params) }) else { return }
+            emit(.commandOutput(output)); return
+        }
         if method == "fuzzyFileSearch/sessionUpdated" { emit(.fileSearchUpdated(params)); return }
         if method == "fuzzyFileSearch/sessionCompleted" { emit(.fileSearchCompleted(params)); return }
         if method == "item/started", let raw = params["item"] {
-            let item = CodexItem(raw: raw, turnID: params["turnId"]?.stringValue); reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
+            guard let item = decodeOrReport(method, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
+            reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
         }
         if method == "item/completed", let raw = params["item"] {
-            let item = CodexItem(raw: raw, turnID: params["turnId"]?.stringValue); reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
+            guard let item = decodeOrReport(method, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
+            reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
         }
         if method == "turn/started", let raw = params["turn"] {
-            let turn = CodexTurn(threadID: threadID ?? "", raw: raw); reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
+            guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
+            guard let turn = decodeOrReport(method, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
+            reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
         }
         if method == "turn/completed", let raw = params["turn"] {
-            let turn = CodexTurn(threadID: threadID ?? "", raw: raw); reduceTurn(turn, completed: true); emit(.turnCompleted(threadID: threadID, turn: turn)); return
+            guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
+            guard let turn = decodeOrReport(method, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
+            reduceTurn(turn, completed: true); emit(.turnCompleted(threadID: threadID, turn: turn)); return
         }
         let itemDeltaMethods: Set<String> = [
             "item/agentMessage/delta", "item/plan/delta", "item/reasoning/textDelta",
@@ -406,14 +434,13 @@ public actor CodexClient {
     }
 
     private func reduceItem(_ item: CodexItem, threadID: String?, authoritative: Bool) {
-        guard let threadID, !item.id.isEmpty else { return }
+        guard let threadID else { return }
         var state = threadStates[threadID] ?? .init()
         if state.items[item.id] == nil { state.itemOrder.append(item.id) }
         if authoritative || state.items[item.id] == nil { state.items[item.id] = item }
         threadStates[threadID] = state
     }
     func reduceTurn(_ turn: CodexTurn, completed: Bool) {
-        guard !turn.threadID.isEmpty, !turn.id.isEmpty else { return }
         var state = threadStates[turn.threadID] ?? .init()
         if state.turns[turn.id] == nil { state.turnOrder.append(turn.id) }
         state.turns[turn.id] = turn
@@ -422,27 +449,29 @@ public actor CodexClient {
     }
 
     func applyThreadSnapshot(_ thread: CodexThread, includesTurns: Bool) {
-        guard !thread.id.isEmpty else { return }
         var snapshot = threadStates[thread.id] ?? .init()
         snapshot.thread = thread
+        // Replay can cover hundreds of elements, so malformed ones are counted and reported once
+        // rather than emitted individually into a bounded subscriber queue.
+        var skipped = 0
         if includesTurns, let history = thread.raw["turns"]?.arrayValue {
             snapshot.turns = [:]; snapshot.items = [:]; snapshot.activeTurnIDs = []
             snapshot.turnOrder = []; snapshot.itemOrder = []
             for rawTurn in history {
-                let turn = CodexTurn(threadID: thread.id, raw: rawTurn)
-                guard !turn.id.isEmpty else { continue }
+                guard let turn = try? CodexTurn(threadID: thread.id, raw: rawTurn) else { skipped += 1; continue }
                 if snapshot.turns[turn.id] == nil { snapshot.turnOrder.append(turn.id) }
                 snapshot.turns[turn.id] = turn
                 if turn.status == "inProgress" { snapshot.activeTurnIDs.insert(turn.id) }
                 for rawItem in rawTurn["items"]?.arrayValue ?? [] {
-                    let item = CodexItem(raw: rawItem, turnID: turn.id)
-                    guard !item.id.isEmpty else { continue }
+                    guard let item = try? CodexItem(raw: rawItem, turnID: turn.id) else { skipped += 1; continue }
                     if snapshot.items[item.id] == nil { snapshot.itemOrder.append(item.id) }
                     snapshot.items[item.id] = item
                 }
             }
         }
         threadStates[thread.id] = snapshot
+        // Report the caveat before the snapshot it qualifies.
+        if skipped > 0 { emit(malformed("thread/history", "skipped \(skipped) malformed turns/items")) }
         emit(.threadStateUpdated(threadID: thread.id, state: snapshot))
     }
 

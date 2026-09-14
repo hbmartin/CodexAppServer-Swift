@@ -2,7 +2,7 @@
 
 `CodexAppServerSDK` 0.2.0 is a Swift 6.2 SDK for building interactive Codex clients on macOS 15+ and iOS 26+. It speaks the Codex app-server protocol directly: tasks (protocol “threads”), turns, streamed items, approvals, questions, tools, reconnect recovery, and raw forward-compatible messages.
 
-This is a clean break from the former `CodexAppSDK` API. Source compatibility is promised for public APIs across 0.2.x patch releases, excluding `CodexAppServerRemoteExperimental`.
+This is a clean break from the former `CodexAppSDK` API. No release is tagged yet, so the public API is still moving. From the first `0.2.x` tag onward, source compatibility will be promised for public APIs across patch releases, excluding `CodexAppServerRemoteExperimental`; CI enforces that promise with `swift package diagnose-api-breaking-changes` against the latest tag.
 
 ## Products
 
@@ -188,10 +188,13 @@ Structured logging is silent by default and accepts an application sink. Payload
 
 ```sh
 swift test
-Scripts/check-schema-drift.sh
+Scripts/check-sdk-schema-conformance.sh   # does the SDK still match the pinned snapshot?
+Scripts/check-schema-drift.sh             # has upstream moved away from the snapshot?
 ```
 
-The reviewed CLI 0.146.0 snapshot is in `Schemas/0.146.0`. CI should regenerate it with the latest supported CLI and fail on differences, build macOS 15 and iOS 26, enforce Swift 6 concurrency, build DocC, and compare API compatibility with the latest 0.2.x tag.
+The reviewed CLI 0.146.0 snapshot is in `Schemas/0.146.0`. CI regenerates it with the pinned CLI and fails on any difference, builds macOS 15 and iOS 26, enforces Swift 6 strict concurrency, builds DocC for every library target, and compares API compatibility against the latest 0.2.x tag. A weekly job additionally audits the snapshot against `codex@latest` as an early warning that upstream has moved.
+
+`Scripts/check-schema-drift.sh` also checks the SDK against the snapshot, not just the snapshot against upstream: every method the SDK sends must exist in `ClientRequest.json`, every notification method it routes must exist in `ServerNotification.json`, and `CodexItemKind` must still match the `ThreadItem` discriminator. A removed case fails; a new upstream case only warns, because unknown values already degrade through `.unknown`.
 
 Authenticated local tests are opt-in. Any test that starts a model turn must set an explicit Luna model and fails closed otherwise:
 

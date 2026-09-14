@@ -17,10 +17,13 @@ let package = Package(
         .target(name: "CodexAppServerObservation", dependencies: ["CodexAppServerKit"]),
         .target(name: "CodexAppServerRemoteExperimental", dependencies: ["CodexAppServerKit"]),
         .executableTarget(name: "CodexAppServerCLI", dependencies: ["CodexAppServerKit", "CodexAppServerHost", "CodexAppServerRemoteExperimental"]),
-        .testTarget(name: "CodexAppServerKitTests", dependencies: ["CodexAppServerKit"]),
-        .testTarget(name: "CodexAppServerHostTests", dependencies: ["CodexAppServerHost", "CodexAppServerKit"]),
-        .testTarget(name: "CodexAppServerObservationTests", dependencies: ["CodexAppServerObservation", "CodexAppServerKit"]),
-        .testTarget(name: "CodexAppServerRemoteExperimentalTests", dependencies: ["CodexAppServerRemoteExperimental", "CodexAppServerKit"]),
+        // Shared fakes for the test targets. Not a product: it is deliberately not part of the
+        // SDK's public surface, and it needs only CodexAppServerKit's public API.
+        .target(name: "CodexAppServerTestSupport", dependencies: ["CodexAppServerKit"]),
+        .testTarget(name: "CodexAppServerKitTests", dependencies: ["CodexAppServerKit", "CodexAppServerTestSupport"]),
+        .testTarget(name: "CodexAppServerHostTests", dependencies: ["CodexAppServerHost", "CodexAppServerKit", "CodexAppServerTestSupport"]),
+        .testTarget(name: "CodexAppServerObservationTests", dependencies: ["CodexAppServerObservation", "CodexAppServerKit", "CodexAppServerTestSupport"]),
+        .testTarget(name: "CodexAppServerRemoteExperimentalTests", dependencies: ["CodexAppServerRemoteExperimental", "CodexAppServerKit", "CodexAppServerTestSupport"]),
         .testTarget(name: "CodexAppServerCLITests", dependencies: ["CodexAppServerCLI", "CodexAppServerKit"]),
     ],
     swiftLanguageModes: [.v6]

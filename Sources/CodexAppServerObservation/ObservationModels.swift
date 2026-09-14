@@ -147,13 +147,19 @@ public final class CodexCombinePublishers {
                     guard let self else { return }; events.send(event)
                     if case .connection(let value) = event { connection.send(value) }
                     if case .serverRequest(let value) = event { interactions.send(value) }
-                    if case .notification(let method, let params) = event, method.hasPrefix("thread/"), let raw = params["thread"], let id = raw["id"]?.stringValue {
-                        knownThreads[id] = .init(raw: raw); threads.send(Array(knownThreads.values))
+                    if case .notification(let method, let params) = event, method.hasPrefix("thread/"),
+                       let raw = params["thread"], let thread = try? CodexThread(raw: raw) {
+                        knownThreads[thread.id] = thread; threads.send(Array(knownThreads.values))
                     }
                 }
             } catch {}
         }
     }
-    public func publishThreads(_ values: [CodexThread]) { knownThreads = Dictionary(uniqueKeysWithValues: values.map { ($0.id, $0) }); threads.send(values) }
+    /// Replaces the published set. Duplicate IDs keep the last occurrence rather than trapping —
+    /// a server may legitimately repeat a thread across pages.
+    public func publishThreads(_ values: [CodexThread]) {
+        knownThreads = Dictionary(values.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        threads.send(values)
+    }
     public func stopObserving() { task?.cancel(); task = nil }
 }
