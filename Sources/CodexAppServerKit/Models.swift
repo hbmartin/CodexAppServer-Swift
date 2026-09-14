@@ -4,11 +4,13 @@ public protocol CodexRawModel: Sendable, Equatable { var raw: JSONValue { get } 
 
 public struct CodexThread: CodexRawModel, Identifiable {
     public let raw: JSONValue
-    public var id: String { raw["id"]?.stringValue ?? "" }
+    /// Validated at initialization, so it is never empty.
+    public let id: String
     public var name: String? { raw["name"]?.stringValue }
     public var status: String? { raw["status"]?.stringValue ?? raw["status"]?["type"]?.stringValue }
     public var statusValue: CodexThreadStatus { .init(raw["status"] ?? .null) }
-    public init(raw: JSONValue) { self.raw = raw }
+    /// - Throws: `CodexError.missingField` when `raw` carries no usable `id`.
+    public init(raw: JSONValue) throws { self.id = try raw.requireString("id", context: "thread"); self.raw = raw }
 }
 
 public enum CodexThreadStatus: Sendable, Equatable {
@@ -24,11 +26,17 @@ public enum CodexThreadStatus: Sendable, Equatable {
     }
 }
 public struct CodexTurn: CodexRawModel, Identifiable {
+    /// Validated at initialization, so it is never empty.
     public let threadID: String
     public let raw: JSONValue
-    public var id: String { raw["id"]?.stringValue ?? "" }
+    /// Validated at initialization, so it is never empty.
+    public let id: String
     public var status: String? { raw["status"]?.stringValue }
-    public init(threadID: String, raw: JSONValue) { self.threadID = threadID; self.raw = raw }
+    /// - Throws: `CodexError.invalidArgument` for an empty `threadID`, or `CodexError.missingField` for an unusable `id`.
+    public init(threadID: String, raw: JSONValue) throws {
+        guard !threadID.isEmpty else { throw CodexError.invalidArgument("threadID must not be empty") }
+        self.threadID = threadID; self.id = try raw.requireString("id", context: "turn"); self.raw = raw
+    }
 }
 
 public enum CodexItemKind: Sendable, Equatable {
@@ -63,9 +71,13 @@ public enum CodexItemKind: Sendable, Equatable {
 public struct CodexItem: CodexRawModel, Identifiable {
     public let raw: JSONValue
     public let turnID: String?
-    public var id: String { raw["id"]?.stringValue ?? "" }
+    /// Validated at initialization, so it is never empty.
+    public let id: String
     public var kind: CodexItemKind { .init(raw["type"]?.stringValue ?? "unknown") }
-    public init(raw: JSONValue, turnID: String? = nil) { self.raw = raw; self.turnID = turnID }
+    /// - Throws: `CodexError.missingField` when `raw` carries no usable `id`.
+    public init(raw: JSONValue, turnID: String? = nil) throws {
+        self.id = try raw.requireString("id", context: "item"); self.raw = raw; self.turnID = turnID
+    }
 }
 
 public struct CodexPage<Element: Sendable & Equatable>: Sendable, Equatable {
@@ -144,10 +156,10 @@ public enum CodexInput: Sendable, Equatable {
     }
 }
 
-public struct CodexModel: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["id"]?.stringValue ?? raw["model"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
-public struct CodexSkill: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["name"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
-public struct CodexCollaborationMode: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["name"]?.stringValue ?? raw["mode"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
-public struct CodexPermissionProfile: CodexRawModel, Identifiable { public let raw: JSONValue; public var id: String { raw["id"]?.stringValue ?? "" }; public init(raw: JSONValue) { self.raw = raw } }
+public struct CodexModel: CodexRawModel, Identifiable { public let raw: JSONValue; public let id: String; public init(raw: JSONValue) throws { self.id = try raw.requireString("id", "model", context: "model"); self.raw = raw } }
+public struct CodexSkill: CodexRawModel, Identifiable { public let raw: JSONValue; public let id: String; public init(raw: JSONValue) throws { self.id = try raw.requireString("name", context: "skill"); self.raw = raw } }
+public struct CodexCollaborationMode: CodexRawModel, Identifiable { public let raw: JSONValue; public let id: String; public init(raw: JSONValue) throws { self.id = try raw.requireString("name", "mode", context: "collaborationMode"); self.raw = raw } }
+public struct CodexPermissionProfile: CodexRawModel, Identifiable { public let raw: JSONValue; public let id: String; public init(raw: JSONValue) throws { self.id = try raw.requireString("id", context: "permissionProfile"); self.raw = raw } }
 
 public struct CodexReviewTarget: Sendable, Equatable {
     public enum Kind: Sendable, Equatable { case uncommitted, baseBranch(String), commit(String), custom(String) }

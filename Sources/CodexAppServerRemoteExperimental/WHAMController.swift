@@ -22,7 +22,11 @@ public struct WHAMHost: Sendable, Equatable, Identifiable {
     public var name: String?
     public var online: Bool?
     public var raw: JSONValue
-    public init(raw: JSONValue) { self.raw = raw; id = raw["serverId"]?.stringValue ?? raw["hostId"]?.stringValue ?? raw["id"]?.stringValue ?? ""; name = raw["name"]?.stringValue; online = raw["online"]?.boolValue }
+    /// - Throws: `CodexError.missingField` when `raw` carries none of `serverId`, `hostId` or `id`.
+    public init(raw: JSONValue) throws {
+        id = try raw.requireString("serverId", "hostId", "id", context: "host")
+        self.raw = raw; name = raw["name"]?.stringValue; online = raw["online"]?.boolValue
+    }
 }
 
 public struct WHAMEndpoints: Sendable {
@@ -58,12 +62,13 @@ public actor WHAMController {
     @discardableResult
     public func claim(_ code: WHAMPairingCode) async throws -> WHAMPairingGrant {
         let result = try await request(path: endpoints.claimPath, method: "POST", body: ["pairing_code": .string(code.value), "protocol_version": "2"])
-        guard let hostID = result["serverId"]?.stringValue ?? result["hostId"]?.stringValue, let value = result["pairingGrant"]?.stringValue ?? result["grant"]?.stringValue else { throw CodexError.missingField("serverId/pairingGrant") }
+        let hostID = try WHAMHost(raw: result).id
+        let value = try result.requireString("pairingGrant", "grant", context: "pairing")
         let grant = WHAMPairingGrant(hostID: hostID, environmentID: result["environmentId"]?.stringValue, grant: value); try await grants.save(grant); return grant
     }
     public func listPairedHosts() async throws -> [WHAMHost] {
         let result = try await request(path: endpoints.hostsPath, method: "GET", body: nil)
-        return (result["servers"]?.arrayValue ?? result["data"]?.arrayValue ?? []).map(WHAMHost.init)
+        return try (result["servers"]?.arrayValue ?? result["data"]?.arrayValue ?? []).map(WHAMHost.init)
     }
     public func revoke(hostID: String) async throws {
         _ = try await request(path: endpoints.revokePath(hostID), method: "DELETE", body: nil); try await grants.remove(hostID: hostID)
@@ -87,7 +92,11 @@ public actor WHAMController {
     }
 }
 
-private actor WHAMCursor {
+/// Monotonic protocol-v2 sequence cursor. Rejects replayed or out-of-order frames.
+///
+/// Internal rather than private so the suppression rule can be tested directly; it is not
+/// part of the public surface.
+actor WHAMCursor {
     private var value: Int64 = 0
     func current() -> Int64 { value }
     func accept(_ candidate: Int64) -> Bool { guard candidate > value else { return false }; value = candidate; return true }

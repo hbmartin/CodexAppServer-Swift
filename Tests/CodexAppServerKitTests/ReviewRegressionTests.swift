@@ -1,63 +1,16 @@
 import Foundation
 import Testing
+import CodexAppServerTestSupport
 @testable import CodexAppServerKit
 
-private actor ReviewTransport: CodexTransport {
-    nonisolated let incomingFrames: AsyncThrowingStream<Data, Error>
-    nonisolated let diagnostics: AsyncStream<CodexTransportDiagnostic>
-    let frames: AsyncThrowingStream<Data, Error>.Continuation
-    let diagnostic: AsyncStream<CodexTransportDiagnostic>.Continuation
-    var sent: [JSONValue] = []
-    var closed = false
-    var results: [String: JSONValue]
-    var delayResponses: Bool
-    var replayOnResume: Bool
-    var startGate: ReviewFactoryGate?
-    var rejectResponses = false
-    var replayOnInitialized = false
-    init(results: [String: JSONValue] = [:], delayResponses: Bool = false, replayOnResume: Bool = false) {
-        self.replayOnResume = replayOnResume
-        self.results = results; self.delayResponses = delayResponses
-        let f = AsyncThrowingStream<Data, Error>.makeStream(); incomingFrames = f.stream; frames = f.continuation
-        let d = AsyncStream<CodexTransportDiagnostic>.makeStream(); diagnostics = d.stream; diagnostic = d.continuation
-    }
-    func start() async { await startGate?.wait() }
-    func holdStart(at gate: ReviewFactoryGate) { startGate = gate }
-    func failResponses() { rejectResponses = true }
-    func replayWhenInitialized() { replayOnInitialized = true }
-    func send(frame: Data) async throws {
-        let message = try JSONValue.decode(frame); sent.append(message)
-        if message["method"]?.stringValue == "initialized", replayOnInitialized {
-            try inject(["id": 56, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        if message["result"] != nil, rejectResponses { throw CodexError.transportClosed("ambiguous send failure") }
-        if message["result"] != nil, delayResponses { try await Task.sleep(for: .milliseconds(50)) }
-        guard let id = message["id"], let method = message["method"]?.stringValue else { return }
-        if method == "thread/resume", replayOnResume {
-            try inject(["id": 55, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        try inject(["id": id, "result": results[method] ?? .object([:])])
-    }
-    func inject(_ value: JSONValue) throws { frames.yield(try value.encoded()) }
-    func close() { closed = true; frames.finish(); diagnostic.finish() }
-    func messages() -> [JSONValue] { sent }
-}
-
-private func reviewClient(_ transport: ReviewTransport) async throws -> CodexClient {
-    let client = CodexClient(transportFactory: .init { transport }, configuration: .init(requestTimeout: .seconds(2), reconnectPolicy: .init(maximumAttempts: 0)))
-    _ = try await client.connect(); return client
-}
-
-@Test func reviewCommandOutputDecodesProtocolBytes() {
-    let output = CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGVsbG8=", "capReached": false])
+@Test func reviewCommandOutputDecodesProtocolBytes() throws {
+    let output = try CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGVsbG8=", "capReached": false])
     #expect(String(decoding: output.data, as: UTF8.self) == "hello")
 }
 
 @Test func reviewHistoryUnwrapsItemEntries() async throws {
-    let transport = ReviewTransport(results: ["thread/items/list": ["data": [["turnId": "u", "item": ["id": "i", "type": "agentMessage", "text": "hello"]]]]])
-    let client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(results: ["thread/items/list": ["data": [["turnId": "u", "item": ["id": "i", "type": "agentMessage", "text": "hello"]]]]])
+    let client = try await CodexClient.connectedTestClient(transport)
     let page = try await client.listItems(threadID: "t")
     #expect(page.items.first?.id == "i")
     #expect(page.items.first?.kind == .agentMessage)
@@ -66,8 +19,8 @@ private func reviewClient(_ transport: ReviewTransport) async throws -> CodexCli
 }
 
 @Test func reviewSteerReturnsServerTurnID() async throws {
-    let transport = ReviewTransport(results: ["turn/steer": ["turnId": "u"]])
-    let client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(results: ["turn/steer": ["turnId": "u"]])
+    let client = try await CodexClient.connectedTestClient(transport)
     let turn = try await client.steerTurn(threadID: "t", expectedTurnID: "u", inputs: [.text("more")])
     #expect(turn.id == "u")
     await client.close()
@@ -79,15 +32,15 @@ private func reviewClient(_ transport: ReviewTransport) async throws -> CodexCli
 }
 
 @Test func reviewDiscoveryUnwrapsSkillsAndPreservesProfileIDs() async throws {
-    let transport = ReviewTransport(results: ["skills/list": ["data": [["cwd": "/work", "skills": [["name": "example", "path": "/work/SKILL.md"]], "errors": []]]], "permissionProfile/list": ["data": [["id": "read-only", "allowed": true]]]])
-    let client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(results: ["skills/list": ["data": [["cwd": "/work", "skills": [["name": "example", "path": "/work/SKILL.md"]], "errors": []]]], "permissionProfile/list": ["data": [["id": "read-only", "allowed": true]]]])
+    let client = try await CodexClient.connectedTestClient(transport)
     #expect(try await client.listSkills().first?.id == "example")
     #expect(try await client.listPermissionProfiles().first?.id == "read-only")
     await client.close()
 }
 
 @Test func reviewResponseIsOneShotUnderConcurrentCallers() async throws {
-    let transport = ReviewTransport(delayResponses: true), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(delayResponses: true), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .unbounded)
     try await transport.inject(["id": 44, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
     var iterator = subscription.events.makeAsyncIterator()
@@ -100,7 +53,7 @@ private func reviewClient(_ transport: ReviewTransport) async throws -> CodexCli
 }
 
 @Test func reviewResolvedNumericIDInvalidatesHandle() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .unbounded)
     try await transport.inject(["id": 44, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
     var iterator = subscription.events.makeAsyncIterator()
@@ -112,30 +65,24 @@ private func reviewClient(_ transport: ReviewTransport) async throws -> CodexCli
     await client.close()
 }
 
-private actor ReviewFactoryGate {
-    var waiting = false
-    var continuation: CheckedContinuation<Void, Never>?
-    func wait() async { waiting = true; await withCheckedContinuation { continuation = $0 } }
-    func release() { continuation?.resume(); continuation = nil }
-}
 
 @Test func reviewClosePreventsInflightConnectFromReopening() async throws {
-    let gate = ReviewFactoryGate(), transport = ReviewTransport()
+    let gate = CodexTestGate(), transport = CodexScriptedTransport()
     let client = CodexClient(transportFactory: .init { await gate.wait(); return transport }, configuration: .init(requestTimeout: .seconds(2), reconnectPolicy: .init(maximumAttempts: 0)))
     let connection = Task { try? await client.connect() }
-    while !(await gate.waiting) { await Task.yield() }
+    while !(await gate.isWaiting()) { await Task.yield() }
     await client.close()
     await gate.release()
     _ = await connection.value
     #expect(await client.connectionState() == .disconnected)
-    #expect(await transport.closed)
+    #expect(await transport.isClosed())
     await client.close()
 }
 
 @Test func reviewHistoryHydratesStateAndClearsStaleActiveTurns() async throws {
-    let transport = ReviewTransport(results: ["thread/read": ["thread": ["id": "t", "status": ["type": "idle"], "turns": [["id": "u", "status": "completed", "items": [["id": "i", "type": "agentMessage", "text": "done"]]]]]]])
-    let client = try await reviewClient(transport)
-    await client.reduceTurn(.init(threadID: "t", raw: ["id": "u", "status": "inProgress"]), completed: false)
+    let transport = CodexScriptedTransport(results: ["thread/read": ["thread": ["id": "t", "status": ["type": "idle"], "turns": [["id": "u", "status": "completed", "items": [["id": "i", "type": "agentMessage", "text": "done"]]]]]]])
+    let client = try await CodexClient.connectedTestClient(transport)
+    await client.reduceTurn(try .init(threadID: "t", raw: ["id": "u", "status": "inProgress"]), completed: false)
     _ = try await client.readThread(id: "t", includeTurns: true)
     #expect(await client.turnStatus(threadID: "t", turnID: "u") == "completed")
     #expect(await client.state(for: "t")?.activeTurnIDs.isEmpty == true)
@@ -144,7 +91,7 @@ private actor ReviewFactoryGate {
 }
 
 @Test func reviewDeltaCoalescingPreservesAppendedText() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .boundedCoalescingDeltas(1))
     await client.emit(.itemDelta(threadID: "t", itemID: "i", method: "item/agentMessage/delta", delta: ["delta": "hello "]))
     await client.emit(.itemDelta(threadID: "t", itemID: "i", method: "item/agentMessage/delta", delta: ["delta": "world"]))
@@ -155,7 +102,7 @@ private actor ReviewFactoryGate {
 }
 
 @Test func reviewCommandAndReasoningDeltasRouteAsTypedEvents() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .unbounded)
     try await transport.inject(["method": "item/reasoning/textDelta", "params": ["threadId": "t", "turnId": "u", "itemId": "i", "delta": "reasoning", "contentIndex": 0]])
     var iterator = subscription.events.makeAsyncIterator()
@@ -164,7 +111,7 @@ private actor ReviewFactoryGate {
 }
 
 @Test func reviewUsageUpdatesAreAvailableThroughTypedAccessor() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .unbounded)
     try await transport.inject(["method": "thread/tokenUsage/updated", "params": ["threadId": "t", "turnId": "u", "tokenUsage": ["total": ["totalTokens": 123]]]])
     var iterator = subscription.events.makeAsyncIterator(); _ = try await iterator.next()
@@ -173,7 +120,7 @@ private actor ReviewFactoryGate {
 }
 
 @Test func reviewNullNetworkContextIsCommandApproval() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .unbounded)
     try await transport.inject(["id": 44, "method": "item/commandExecution/requestApproval", "params": ["threadId": "t", "networkApprovalContext": .null]])
     var iterator = subscription.events.makeAsyncIterator()
@@ -182,21 +129,13 @@ private actor ReviewFactoryGate {
     await client.close()
 }
 
-private actor ReviewTransportSequence {
-    var transports: [ReviewTransport]
-    init(_ transports: [ReviewTransport]) { self.transports = transports }
-    func next() throws -> ReviewTransport {
-        guard !transports.isEmpty else { throw CodexError.transportClosed("exhausted") }
-        return transports.removeFirst()
-    }
-}
 
 @Test func reviewReplayedInteractionHandlerCanRespondDuringRecovery() async throws {
     let history: JSONValue = ["thread": ["id": "t", "status": ["type": "active", "activeFlags": ["waitingOnUserInput"]], "turns": []]]
-    let first = ReviewTransport(results: ["thread/resume": history, "thread/read": history])
-    let second = ReviewTransport(results: ["thread/resume": history, "thread/read": history], replayOnResume: true)
-    let sequence = ReviewTransportSequence([first, second])
-    let client = CodexClient(transportFactory: .init { try await sequence.next() }, configuration: .init(requestTimeout: .seconds(2), reconnectPolicy: .init(maximumAttempts: 1, initialDelay: .zero, maximumDelay: .zero, jitter: false)))
+    let first = CodexScriptedTransport(results: ["thread/resume": history, "thread/read": history])
+    let second = CodexScriptedTransport(results: ["thread/resume": history, "thread/read": history], replayOnResume: true)
+    let sequence = CodexTransportSequence([first, second])
+    let client = CodexClient(transportFactory: .init { try await sequence.next() }, configuration: CodexClient.immediateReconnectConfiguration)
     _ = try await client.connect(); _ = try await client.subscribeThread(id: "t")
     await client.setInteractionHandler { _ in .answers([:]) }
     await first.close()
@@ -216,19 +155,19 @@ private actor ReviewTransportSequence {
 }
 
 @Test func closeDuringTransportStartClosesLateTransport() async throws {
-    let gate = ReviewFactoryGate(), transport = ReviewTransport()
+    let gate = CodexTestGate(), transport = CodexScriptedTransport()
     await transport.holdStart(at: gate)
     let client = CodexClient(transportFactory: .init { transport })
     let connection = Task { try? await client.connect() }
-    while !(await gate.waiting) { await Task.yield() }
+    while !(await gate.isWaiting()) { await Task.yield() }
     await client.close(); await gate.release(); _ = await connection.value
     #expect(await client.connectionState() == .disconnected)
-    #expect(await transport.closed)
+    #expect(await transport.isClosed())
 }
 
 @Test func closeCancelsReconnectBackoffBeforeCreatingTransport() async throws {
-    let first = ReviewTransport(), second = ReviewTransport()
-    let sequence = ReviewTransportSequence([first, second])
+    let first = CodexScriptedTransport(), second = CodexScriptedTransport()
+    let sequence = CodexTransportSequence([first, second])
     let client = CodexClient(transportFactory: .init { try await sequence.next() }, configuration: .init(reconnectPolicy: .init(maximumAttempts: 1, initialDelay: .seconds(10), jitter: false)))
     _ = try await client.connect()
     let events = await client.subscribe(policy: .unbounded)
@@ -238,27 +177,27 @@ private actor ReviewTransportSequence {
     }
     await client.close()
     try await Task.sleep(for: .milliseconds(30))
-    #expect(await sequence.transports.count == 1)
+    #expect(await sequence.remainingCount() == 1)
     #expect(await client.connectionState() == .disconnected)
 }
 
 @Test func supersededConnectCannotTearDownNewConnection() async throws {
-    let gate = ReviewFactoryGate(), first = ReviewTransport(), second = ReviewTransport()
+    let gate = CodexTestGate(), first = CodexScriptedTransport(), second = CodexScriptedTransport()
     await first.holdStart(at: gate)
-    let sequence = ReviewTransportSequence([first, second])
+    let sequence = CodexTransportSequence([first, second])
     let client = CodexClient(transportFactory: .init { try await sequence.next() })
     let initial = Task { try? await client.connect() }
-    while !(await gate.waiting) { await Task.yield() }
+    while !(await gate.isWaiting()) { await Task.yield() }
     _ = try await client.reconnect()
     await gate.release(); _ = await initial.value
     #expect(await client.connectionState() == .connected(generation: 1))
-    #expect(await first.closed)
-    #expect(!(await second.closed))
+    #expect(await first.isClosed())
+    #expect(!(await second.isClosed()))
     await client.close()
 }
 
 @Test func directResponsesAreReservedBeforeTransportSend() async throws {
-    let transport = ReviewTransport(delayResponses: true), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(delayResponses: true), client = try await CodexClient.connectedTestClient(transport)
     let events = await client.subscribe(policy: .unbounded)
     try await transport.inject(["id": 44, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
     var iterator = events.events.makeAsyncIterator(); _ = try await iterator.next()
@@ -271,7 +210,7 @@ private actor ReviewTransportSequence {
 }
 
 @Test func ambiguousResponseFailureCannotBeRetried() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     await transport.failResponses()
     let events = await client.subscribe(policy: .unbounded)
     try await transport.inject(["id": 44, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
@@ -292,7 +231,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
     switch scenario {
     case "differentItem": next = .itemDelta(threadID: "t", itemID: "j", method: "item/reasoning/textDelta", delta: ["delta": "d", "contentIndex": 0])
     case "differentSegment": next = .itemDelta(threadID: "t", itemID: "i", method: "item/reasoning/textDelta", delta: ["delta": "d", "contentIndex": 1])
-    case "lifecycle": next = .itemCompleted(threadID: "t", item: .init(raw: ["id": "i", "type": "reasoning"]))
+    case "lifecycle": next = .itemCompleted(threadID: "t", item: try .init(raw: ["id": "i", "type": "reasoning"]))
     default: next = .itemDelta(threadID: "t", itemID: "i", method: "item/reasoning/textDelta", delta: ["delta": "def", "contentIndex": 0])
     }
     #expect(buffer.yield(first))
@@ -303,7 +242,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
 }
 
 @Test func cancellingIdleEventIteratorFinishesIt() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.subscribe(policy: .boundedCoalescingDeltas(1))
     let reader = Task {
         var iterator = subscription.events.makeAsyncIterator()
@@ -317,7 +256,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
 }
 
 @Test func replayBeforeInitializedSendReturnsCanBeAnswered() async throws {
-    let transport = ReviewTransport()
+    let transport = CodexScriptedTransport()
     await transport.replayWhenInitialized()
     let client = CodexClient(transportFactory: .init { transport }, configuration: .init(requestTimeout: .seconds(2)))
     await client.setInteractionHandler { _ in .answers([:]) }
@@ -327,7 +266,7 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
 }
 
 @Test func reviewItemLifecycleRetainsOwningTurn() async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let subscription = await client.events(for: "t", policy: .unbounded)
     var iterator = subscription.events.makeAsyncIterator()
     for method in ["item/started", "item/completed"] {
@@ -362,10 +301,10 @@ func reviewLoggerRedactsSensitiveMetadataInSink(fragment: String) {
 
 @Test(arguments: [CodexBufferingPolicy.boundedFailing(1), .boundedCoalescingDeltas(1)])
 func reviewSubscriberOverflowDoesNotCloseClient(policy: CodexBufferingPolicy) async throws {
-    let transport = ReviewTransport(), client = try await reviewClient(transport)
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
     let slow = await client.subscribe(policy: policy)
     let healthy = await client.subscribe(policy: .unbounded)
-    let event = CodexEvent.itemCompleted(threadID: "t", item: .init(raw: ["id": "i"]))
+    let event = CodexEvent.itemCompleted(threadID: "t", item: try .init(raw: ["id": "i"]))
     await client.emit(event); await client.emit(event)
     var slowIterator = slow.events.makeAsyncIterator()
     #expect(try await slowIterator.next() == event)

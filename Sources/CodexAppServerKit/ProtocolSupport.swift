@@ -6,6 +6,10 @@ public enum CodexError: Error, Sendable, Equatable {
     case rpc(code: Int, message: String, data: JSONValue?)
     case requestTimedOut(method: String), requestCancelled(method: String)
     case missingField(String), unsupportedFeature(String), invalidConfiguration(String), unsafePath(String)
+    case invalidArgument(String)
+    /// The server returned success, but its mutation result could not be decoded.
+    /// The operation may have taken effect. Reconcile server state before retrying.
+    case invalidMutationResponse(method: String, reason: String, response: JSONValue)
     case mediaTooLarge(actual: Int, limit: Int), missingDynamicTool(String)
 }
 
@@ -25,6 +29,9 @@ extension CodexError: LocalizedError {
         case .staleResponseHandle: "This response handle belongs to an earlier connection."
         case .responseAlreadySent: "This interaction has already been answered."
         case .missingField(let field): "The response is missing \(field)."
+        case .invalidArgument(let reason): "Invalid argument: \(reason)"
+        case .invalidMutationResponse(let method, let reason, _):
+            "The server acknowledged \(method), but its response was invalid: \(reason) The operation may have taken effect; reconcile server state before retrying."
         case .unsupportedFeature(let feature): "The connected Codex does not support \(feature)."
         case .invalidConfiguration(let reason): "Invalid configuration: \(reason)"
         case .unsafePath(let path): "Unsafe remote path: \(path)"

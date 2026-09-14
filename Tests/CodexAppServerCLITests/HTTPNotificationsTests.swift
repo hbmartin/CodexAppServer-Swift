@@ -128,8 +128,8 @@ func invalidNotificationConfigurationsAreRejected(source: String) {
     ("interrupted", "turn_interrupted"),
     ("future", "turn_ended"),
 ])
-func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
-    let turn = CodexTurn(threadID: "thread", raw: [
+func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) throws {
+    let turn = try CodexTurn(threadID: "thread", raw: [
         "id": "turn", "status": .string(status),
         "items": [["id": "one", "type": "agentMessage", "text": "older"], ["id": "two", "type": "agentMessage", "text": " final\nanswer "]],
         "error": ["message": "failure"],
@@ -142,11 +142,11 @@ func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
     #expect(result.values["summary"] == "final answer")
 }
 
-@Test func turnSummaryFallsBackAndIsCapped() {
-    let failed = CodexTurn(threadID: "t", raw: ["id": "u", "status": "failed", "items": [], "error": ["message": "  network\nfailed  "]])
+@Test func turnSummaryFallsBackAndIsCapped() throws {
+    let failed = try CodexTurn(threadID: "t", raw: ["id": "u", "status": "failed", "items": [], "error": ["message": "  network\nfailed  "]])
     #expect(CLINotificationContext.makeTurn(threadID: nil, turn: failed, timestamp: "time").values["summary"] == "network failed")
     let longText = String(repeating: "🧭 ", count: 600)
-    let completed = CodexTurn(threadID: "t", raw: ["id": "u", "status": "completed", "items": [["type": "agentMessage", "text": .string(longText)]]])
+    let completed = try CodexTurn(threadID: "t", raw: ["id": "u", "status": "completed", "items": [["type": "agentMessage", "text": .string(longText)]]])
     let summary = CLINotificationContext.makeTurn(threadID: nil, turn: completed, timestamp: "time").values["summary"] ?? ""
     #expect(summary.count == 500)
 }
@@ -183,8 +183,8 @@ func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
     #expect(command.values["summary"] == "run this")
 }
 
-@Test func unrelatedEventsDoNotProduceContexts() {
-    #expect(CLINotificationContext.make(for: .itemCompleted(threadID: "t", item: .init(raw: ["id": "i"])), timestamp: "time") == nil)
+@Test func unrelatedEventsDoNotProduceContexts() throws {
+    #expect(CLINotificationContext.make(for: .itemCompleted(threadID: "t", item: try .init(raw: ["id": "i"])), timestamp: "time") == nil)
     #expect(CLINotificationContext.make(for: .dynamicToolCompleted(name: "tool", callID: "call", success: true), timestamp: "time") == nil)
     #expect(CLINotificationContext.make(for: .threadStateUpdated(threadID: "t", state: .init()), timestamp: "time") == nil)
 }
@@ -231,9 +231,9 @@ func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
         sender: { request in await recorder.send(request) },
         report: { messages.append($0) }
     )
-    let turn = CodexTurn(threadID: "thread", raw: ["id": "turn", "status": "completed", "items": []])
+    let turn = try CodexTurn(threadID: "thread", raw: ["id": "turn", "status": "completed", "items": []])
     await dispatcher.enqueue(.turnCompleted(threadID: "thread", turn: turn))
-    await dispatcher.enqueue(.itemCompleted(threadID: "thread", item: .init(raw: ["id": "item"])))
+    await dispatcher.enqueue(.itemCompleted(threadID: "thread", item: try .init(raw: ["id": "item"])))
     await dispatcher.finish()
     #expect(await recorder.requests.count == 1)
     #expect(messages.values.isEmpty)
@@ -257,8 +257,8 @@ func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
         sender: { request in await counter.next(request) },
         report: { messages.append($0) }
     )
-    let first = CodexTurn(threadID: "t", raw: ["id": "one", "status": "completed", "items": []])
-    let second = CodexTurn(threadID: "t", raw: ["id": "two", "status": "completed", "items": []])
+    let first = try CodexTurn(threadID: "t", raw: ["id": "one", "status": "completed", "items": []])
+    let second = try CodexTurn(threadID: "t", raw: ["id": "two", "status": "completed", "items": []])
     await dispatcher.enqueue(.turnCompleted(threadID: "t", turn: first))
     await dispatcher.enqueue(.turnCompleted(threadID: "t", turn: second))
     await dispatcher.finish()
@@ -271,7 +271,7 @@ func terminalTurnsMapToStableEvents(status: String, expectedEvent: String) {
     let sender = SuspendedSender()
     let configuration = try decodeConfiguration(#"{"url":"https://example.test/{{event}}"}"#)
     let dispatcher = CLINotificationDispatcher(configuration: configuration, sender: { request in await sender.send(request) })
-    let turn = CodexTurn(threadID: "t", raw: ["id": "u", "status": "completed", "items": []])
+    let turn = try CodexTurn(threadID: "t", raw: ["id": "u", "status": "completed", "items": []])
 
     await dispatcher.enqueue(.turnCompleted(threadID: "t", turn: turn))
     while !(await sender.started) { await Task.yield() }

@@ -50,6 +50,17 @@ public extension JSONValue {
     var boolValue: Bool? { if case .bool(let value) = self { value } else { nil } }
     var decimalValue: Decimal? { if case .number(let value) = self { value } else { nil } }
     var intValue: Int? { decimalValue.map { NSDecimalNumber(decimal: $0).intValue } }
+    /// The first non-empty string among `keys`, tried in order.
+    ///
+    /// Identity fields are read through this accessor so that an absent key, a null, a
+    /// wrong-typed value, and an empty string all fail the same way instead of silently
+    /// producing `""`. `context` names the enclosing model for the error message.
+    ///
+    /// - Throws: `CodexError.missingField` naming `context` and the candidate keys.
+    func requireString(_ keys: String..., context: String) throws -> String {
+        for key in keys { if let value = self[key]?.stringValue, !value.isEmpty { return value } }
+        throw CodexError.missingField("\(context).\(keys.joined(separator: "|"))")
+    }
     func encoded(sortedKeys: Bool = false) throws -> Data {
         let encoder = JSONEncoder()
         if sortedKeys { encoder.outputFormatting = [.sortedKeys] }

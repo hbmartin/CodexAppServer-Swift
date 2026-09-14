@@ -57,6 +57,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # Runs first: it needs only the checked-in snapshot, so it still reports even when the
+      # npm install below is unavailable.
+      - name: Check SDK against the schema snapshot
+        run: |
+          Scripts/check-sdk-schema-conformance.sh
+          Scripts/test-sdk-schema-conformance.sh
       - name: Install reviewed schema generator
         run: npm install --global @openai/codex@0.146.0
       - name: Reject schema drift
