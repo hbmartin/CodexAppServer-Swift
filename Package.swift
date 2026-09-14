@@ -21,6 +21,7 @@ let package = Package(
         .testTarget(name: "CodexAppServerHostTests", dependencies: ["CodexAppServerHost", "CodexAppServerKit"]),
         .testTarget(name: "CodexAppServerObservationTests", dependencies: ["CodexAppServerObservation", "CodexAppServerKit"]),
         .testTarget(name: "CodexAppServerRemoteExperimentalTests", dependencies: ["CodexAppServerRemoteExperimental", "CodexAppServerKit"]),
+        .testTarget(name: "CodexAppServerCLITests", dependencies: ["CodexAppServerCLI", "CodexAppServerKit"]),
     ],
     swiftLanguageModes: [.v6]
 )

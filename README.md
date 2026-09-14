@@ -145,6 +145,7 @@ codex-app-server-cli --isolated
 codex-app-server-cli --daemon
 codex-app-server-cli --ssh-proxy my-host-alias
 codex-app-server-cli --ssh-forward my-host --local-port 4501 --remote-port 4500
+codex-app-server-cli --daemon --notify-config ./codex-notifications.json
 codex-app-server-cli --wss wss://codex.example.com \
   --app-bearer-env CODEX_APP_BEARER \
   --tunnel-header CF-Access-Client-Secret \
@@ -152,6 +153,34 @@ codex-app-server-cli --wss wss://codex.example.com \
 ```
 
 Secrets are accepted only through named environment/provider sources, never literal secret flags. The CLI stores no hosts.
+
+### HTTP notifications
+
+Interactive sessions can send best-effort HTTP notifications when a turn ends or Codex is waiting for a human response. Pass one JSON configuration with `--notify-config FILE`; lifecycle commands such as `status` and `restart` do not accept this option. Relative paths are resolved from the directory where the CLI was launched, and requests originate from that Mac.
+
+```json
+{
+  "url": "https://hooks.example/notify?event={{event}}&thread={{thread_id}}",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer ${CODEX_NOTIFY_TOKEN}"
+  },
+  "body": {
+    "event": "{{event}}",
+    "threadId": "{{thread_id}}",
+    "turnId": "{{turn_id}}",
+    "status": "{{status}}",
+    "summary": "{{summary}}"
+  },
+  "timeoutSeconds": 10
+}
+```
+
+`url` is required and must be an absolute HTTP or HTTPS URL. `method` defaults to `GET`, `headers` defaults to empty, and `timeoutSeconds` defaults to 10 and accepts values from 1 through 60. When `body` is present, it can be any JSON value; the CLI adds `Content-Type: application/json` unless the configuration supplies it.
+
+Use `${NAME}` in the URL, header values, or JSON string values to load secrets from non-empty environment variables. Supported event placeholders are `{{event}}`, `{{timestamp}}`, `{{thread_id}}`, `{{turn_id}}`, `{{item_id}}`, `{{request_id}}`, `{{status}}`, `{{interaction_kind}}`, `{{interaction_method}}`, and `{{summary}}`. Values are percent-encoded in the URL and safely JSON-encoded in the body. `event` is one of `turn_completed`, `turn_failed`, `turn_interrupted`, `turn_ended`, or `awaiting_input`; absent values become empty strings.
+
+Delivery does not block Codex event processing and is not retried. HTTP 2xx is considered successful. Other responses and transport failures produce a sanitized stderr message without printing the URL, headers, body, or resolved secrets, and do not stop the interactive session. The CLI waits for requests already in progress before exiting, subject to each request's configured timeout.
 
 ## Logging, tests, and schema drift
 
