@@ -44,8 +44,10 @@ struct CodexAppServerCLI {
 
 #if os(macOS)
     static func run(_ arguments: [String]) async throws {
+        let notificationPath = try notificationConfigurationPath(in: arguments)
+        let lifecycle = arguments.first.flatMap { ["prepare", "status", "start", "stop", "restart", "version"].contains($0) ? $0 : nil }
         let executable = try CodexCLIResolver().resolve(explicitURL: value("--codex", in: arguments).map { URL(fileURLWithPath: $0) })
-        if let lifecycle = arguments.first, ["prepare", "status", "start", "stop", "restart", "version"].contains(lifecycle) {
+        if let lifecycle {
             let controller = CodexDaemonController(executableURL: executable)
             switch lifecycle {
             case "prepare": try await controller.prepareManagedDaemon(); print("managed daemon prepared")
@@ -57,6 +59,7 @@ struct CodexAppServerCLI {
             }
             return
         }
+        let notifier = try notificationPath.map { CLINotificationDispatcher(configuration: try .load(path: $0)) }
         let factory = try await makeFactory(arguments, executable: executable)
         let registry = CodexDynamicToolRegistry(tools: [.init(name: "sdk_echo", description: "Echo JSON input", inputSchema: ["type": "object"]) { .text(String(decoding: try $0.encoded(sortedKeys: true), as: UTF8.self)) }])
         let client = CodexClient(transportFactory: factory, dynamicTools: registry)
@@ -64,12 +67,23 @@ struct CodexAppServerCLI {
         let inbox = InteractionInbox()
         let subscription = await client.subscribe(policy: .boundedCoalescingDeltas(1_024))
         let eventTask = Task {
-            do { for try await event in subscription.events { if case .serverRequest(let request) = event { await inbox.append(request) }; printEvent(event) } }
+            do {
+                for try await event in subscription.events {
+                    if case .serverRequest(let request) = event { await inbox.append(request) }
+                    if let notifier { await notifier.enqueue(event) }
+                    printEvent(event)
+                }
+            }
             catch { print("event stream ended: \(error.localizedDescription)") }
         }
-        defer { eventTask.cancel() }
-        try await repl(client, inbox: inbox)
+        var replError: Error?
+        do { try await repl(client, inbox: inbox) }
+        catch { replError = error }
+        eventTask.cancel()
+        await eventTask.value
         await client.close()
+        if let notifier { await notifier.finish() }
+        if let replError { throw replError }
     }
 
     static func makeFactory(_ arguments: [String], executable: URL) async throws -> CodexTransportFactory {
@@ -136,5 +150,16 @@ struct CodexAppServerCLI {
     }
 
     static func value(_ flag: String, in arguments: [String]) -> String? { guard let index = arguments.firstIndex(of: flag), arguments.indices.contains(index + 1) else { return nil }; return arguments[index + 1] }
+
+    static func notificationConfigurationPath(in arguments: [String]) throws -> String? {
+        let matches = arguments.indices.filter { arguments[$0] == "--notify-config" }
+        guard matches.count <= 1 else { throw CodexError.invalidConfiguration("--notify-config may be supplied only once") }
+        guard let index = matches.first else { return nil }
+        if let first = arguments.first, ["prepare", "status", "start", "stop", "restart", "version"].contains(first) {
+            throw CodexError.invalidConfiguration("--notify-config is available only in interactive mode")
+        }
+        guard arguments.indices.contains(index + 1), !arguments[index + 1].isEmpty, !arguments[index + 1].hasPrefix("--") else { throw CodexError.invalidConfiguration("--notify-config requires a file path") }
+        return arguments[index + 1]
+    }
 #endif
 }
