@@ -9,6 +9,31 @@ public struct CodexRawClient: Sendable {
     public func notify(method: String, params: JSONValue? = nil) async throws { try await client.rawNotify(method: method, params: params) }
 }
 
+enum RoutedNotificationMethod: String, CaseIterable, Sendable {
+    case serverRequestResolved = "serverRequest/resolved"
+    case threadTokenUsageUpdated = "thread/tokenUsage/updated"
+    case commandExecOutputDelta = "command/exec/outputDelta"
+    case fileSearchSessionUpdated = "fuzzyFileSearch/sessionUpdated"
+    case fileSearchSessionCompleted = "fuzzyFileSearch/sessionCompleted"
+    case itemStarted = "item/started"
+    case itemCompleted = "item/completed"
+    case turnStarted = "turn/started"
+    case turnCompleted = "turn/completed"
+    case agentMessageDelta = "item/agentMessage/delta"
+    case planDelta = "item/plan/delta"
+    case reasoningTextDelta = "item/reasoning/textDelta"
+    case reasoningSummaryTextDelta = "item/reasoning/summaryTextDelta"
+    case commandExecutionOutputDelta = "item/commandExecution/outputDelta"
+    case fileChangeOutputDelta = "item/fileChange/outputDelta"
+
+    var requiresThreadID: Bool {
+        switch self {
+        case .serverRequestResolved, .commandExecOutputDelta, .fileSearchSessionUpdated, .fileSearchSessionCompleted: false
+        default: true
+        }
+    }
+}
+
 /// Actor-based, bidirectional JSON-RPC engine for Codex app-server.
 public actor CodexClient {
     private struct Pending {
@@ -124,8 +149,8 @@ public actor CodexClient {
     }
 
     public func subscribe(policy: CodexBufferingPolicy = .default) -> CodexSubscription { makeSubscription(threadID: nil, policy: policy) }
-    public func events(for threadID: String?, policy: CodexBufferingPolicy = .default) throws -> CodexSubscription {
-        if let threadID, threadID.isEmpty { throw CodexError.invalidArgument("threadID must not be empty") }
+    public func events(for threadID: String, policy: CodexBufferingPolicy = .default) throws -> CodexSubscription {
+        if threadID.isEmpty { throw CodexError.invalidArgument("threadID must not be empty") }
         return makeSubscription(threadID: threadID, policy: policy)
     }
 
@@ -137,9 +162,7 @@ public actor CodexClient {
         let lifetime = CodexEventStreamLifetime(buffer: buffer)
         let stream = AsyncThrowingStream<CodexEvent, Error>(unfolding: { try await lifetime.buffer.next() })
         subscribers[id] = Subscriber(threadID: threadID, buffer: buffer)
-        // An empty thread ID is never a real subscription intent: resuming it on reconnect would
-        // send `"threadId": ""`, and it would match every event whose thread ID is absent.
-        if let threadID, !threadID.isEmpty {
+        if let threadID {
             subscriptionIntents.insert(threadID)
             if subscriptionIntents.count == 9 { emit(.diagnostic(.highThreadSubscriptionCount(subscriptionIntents.count))) }
         }
@@ -333,58 +356,73 @@ public actor CodexClient {
     }
 
     private func routeNotification(method: String, params: JSONValue) {
+        guard let routedMethod = RoutedNotificationMethod(rawValue: method) else {
+            emit(.notification(method: method, params: params)); return
+        }
         let threadID = params["threadId"]?.stringValue ?? params["thread"]?["id"]?.stringValue
-        let requiresThreadID: Set<String> = [
-            "item/started", "item/completed", "turn/started", "turn/completed", "thread/tokenUsage/updated",
-            "item/agentMessage/delta", "item/plan/delta", "item/reasoning/textDelta",
-            "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
-        ]
-        if requiresThreadID.contains(method), threadID?.isEmpty != false {
-            emit(malformed(method, "missing or empty params.threadId")); return
+        if routedMethod.requiresThreadID {
+            guard let threadID, !threadID.isEmpty else {
+                emit(malformed(method, "missing or empty params.threadId")); return
+            }
+            routeThreadNotification(routedMethod, threadID: threadID, params: params)
+            return
         }
-        if method == "serverRequest/resolved" {
+        switch routedMethod {
+        case .serverRequestResolved:
             if let id = params["requestId"] { pendingInteractionIDs.remove(id) }
-            emit(.serverRequestResolved(params)); return
+            emit(.serverRequestResolved(params))
+        case .commandExecOutputDelta:
+            guard let output = decodeOrReport(method, { try CodexCommandOutput(raw: params) }) else { return }
+            emit(.commandOutput(output))
+        case .fileSearchSessionUpdated:
+            emit(.fileSearchUpdated(params))
+        case .fileSearchSessionCompleted:
+            emit(.fileSearchCompleted(params))
+        default:
+            assertionFailure("Thread-scoped notification escaped thread-ID validation: \(method)")
         }
-        if method == "thread/tokenUsage/updated", let threadID {
+    }
+
+    private func routeThreadNotification(_ method: RoutedNotificationMethod, threadID: String, params: JSONValue) {
+        switch method {
+        case .threadTokenUsageUpdated:
             var snapshot = threadStates[threadID] ?? .init()
             snapshot.tokenUsage = params["tokenUsage"]
             threadStates[threadID] = snapshot
+            emit(.notification(method: method.rawValue, params: params))
+        case .itemStarted, .itemCompleted:
+            guard let raw = params["item"] else {
+                emit(malformed(method.rawValue, "missing params.item", threadID: threadID)); return
+            }
+            guard let item = decodeOrReport(method.rawValue, threadID: threadID, {
+                try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue)
+            }) else { return }
+            let completed = method == .itemCompleted
+            reduceItem(item, threadID: threadID, authoritative: completed)
+            if completed { emit(.itemCompleted(threadID: threadID, item: item)) }
+            else { emit(.itemStarted(threadID: threadID, item: item)) }
+        case .turnStarted, .turnCompleted:
+            guard let raw = params["turn"] else {
+                emit(malformed(method.rawValue, "missing params.turn", threadID: threadID)); return
+            }
+            guard let turn = decodeOrReport(method.rawValue, threadID: threadID, {
+                try CodexTurn(threadID: threadID, raw: raw)
+            }) else { return }
+            let completed = method == .turnCompleted
+            reduceTurn(turn, completed: completed)
+            if completed { emit(.turnCompleted(threadID: threadID, turn: turn)) }
+            else { emit(.turnStarted(threadID: threadID, turn: turn)) }
+        case .agentMessageDelta, .planDelta, .reasoningTextDelta, .reasoningSummaryTextDelta,
+             .commandExecutionOutputDelta, .fileChangeOutputDelta:
+            emit(.itemDelta(
+                threadID: threadID,
+                itemID: params["itemId"]?.stringValue,
+                method: method.rawValue,
+                delta: params
+            ))
+        default:
+            assertionFailure("Unscoped notification entered thread routing: \(method.rawValue)")
         }
-        if method == "command/exec/outputDelta" {
-            guard let output = decodeOrReport(method, { try CodexCommandOutput(raw: params) }) else { return }
-            emit(.commandOutput(output)); return
-        }
-        if method == "fuzzyFileSearch/sessionUpdated" { emit(.fileSearchUpdated(params)); return }
-        if method == "fuzzyFileSearch/sessionCompleted" { emit(.fileSearchCompleted(params)); return }
-        if method == "item/started" {
-            guard let raw = params["item"] else { emit(malformed(method, "missing params.item", threadID: threadID)); return }
-            guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
-            reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
-        }
-        if method == "item/completed" {
-            guard let raw = params["item"] else { emit(malformed(method, "missing params.item", threadID: threadID)); return }
-            guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
-            reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
-        }
-        if method == "turn/started" {
-            guard let raw = params["turn"] else { emit(malformed(method, "missing params.turn", threadID: threadID)); return }
-            guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
-            guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
-            reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
-        }
-        if method == "turn/completed" {
-            guard let raw = params["turn"] else { emit(malformed(method, "missing params.turn", threadID: threadID)); return }
-            guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
-            guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
-            reduceTurn(turn, completed: true); emit(.turnCompleted(threadID: threadID, turn: turn)); return
-        }
-        let itemDeltaMethods: Set<String> = [
-            "item/agentMessage/delta", "item/plan/delta", "item/reasoning/textDelta",
-            "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
-        ]
-        if itemDeltaMethods.contains(method) { emit(.itemDelta(threadID: threadID, itemID: params["itemId"]?.stringValue, method: method, delta: params)); return }
-        emit(.notification(method: method, params: params))
     }
 
     private func routeServerRequest(id: JSONValue, method: String, params: JSONValue) async {

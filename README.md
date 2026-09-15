@@ -28,11 +28,11 @@ try await client.connect()
 let task = try await client.startThread(
     options: .init(model: "gpt-5.6-luna", workingDirectory: projectURL)
 )
-let events = await client.events(for: task.id, policy: .boundedCoalescingDeltas(1_024))
+let events = try await client.events(for: task.id, policy: .boundedCoalescingDeltas(1_024))
 let turn = try await client.startTurn(threadID: task.id, prompt: "Explain this project")
 ```
 
-Each `subscribe()` or `events(for:)` call creates an independent multicast subscription. The default buffer is 1,024 events and fails only the slow subscriber. Delta-coalescing and unbounded policies are explicit alternatives.
+Each `subscribe()` or `events(for:)` call creates an independent multicast subscription. Use `subscribe()` for all client events and `events(for:)` only for one specific task. The default buffer is 1,024 events and fails only the slow subscriber. Delta-coalescing and unbounded policies are explicit alternatives.
 
 Coalescing preserves adjacent text fragments for the same item and segment. Incompatible events cause an explicit overflow failure rather than silent data loss. Each subscription supports one event iterator; call `cancel()` when its consumer finishes.
 

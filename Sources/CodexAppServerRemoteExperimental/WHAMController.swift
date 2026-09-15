@@ -19,13 +19,13 @@ public struct WHAMPairingGrant: Codable, Sendable, Equatable, Identifiable {
 
 public struct WHAMHost: Sendable, Equatable, Identifiable {
     public let id: String
-    public var name: String?
-    public var online: Bool?
-    public var raw: JSONValue
+    public let raw: JSONValue
+    public var name: String? { raw["name"]?.stringValue }
+    public var online: Bool? { raw["online"]?.boolValue }
     /// - Throws: `CodexError.missingField` when `raw` carries none of `serverId`, `hostId` or `id`.
     public init(raw: JSONValue) throws {
         id = try raw.requireString("serverId", "hostId", "id", context: "host")
-        self.raw = raw; name = raw["name"]?.stringValue; online = raw["online"]?.boolValue
+        self.raw = raw
     }
 }
 

@@ -62,7 +62,7 @@ jobs:
       - name: Check SDK against the schema snapshot
         run: |
           Scripts/check-sdk-schema-conformance.sh
-          Scripts/test-sdk-schema-conformance.sh
+          swift test --filter routedNotificationMethodsExistInPinnedSchema
       - name: Install reviewed schema generator
         run: npm install --global @openai/codex@0.146.0
       - name: Reject schema drift

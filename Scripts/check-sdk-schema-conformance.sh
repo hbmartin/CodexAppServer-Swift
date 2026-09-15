@@ -48,47 +48,7 @@ else
     fi
 fi
 
-# --- (b) every notification method the SDK routes must exist in the schema ------------------
-# The slice is delimited by two anchors. Both must exist: a `sed` range whose end pattern is
-# missing silently runs to end of file, which would quietly widen the slice instead of failing.
-notification_anchors_ok=1
-notification_start='^[[:space:]]*private func routeNotification[(]'
-notification_end='^[[:space:]]*private func routeServerRequest[(]'
-for anchor in "$notification_start" "$notification_end"; do
-    grep -qE "$anchor" "$sources_dir/CodexClient.swift" || {
-        fail "notifications: anchor \"$anchor\" not found in CodexClient.swift — was it renamed?"
-        notification_anchors_ok=0
-    }
-done
-
-sed -nE "/$notification_start/,/$notification_end/p" "$sources_dir/CodexClient.swift" \
-    > "$work_dir/notification-route"
-
-# Extract operands from direct `method == "..."` conditions and the Set<String> collections
-# passed to `contains(method)`. Method spelling is irrelevant, so slash-free methods are kept.
-{
-    grep -oE 'method[[:space:]]*==[[:space:]]*"[^"]*"' "$work_dir/notification-route"
-    sed -nE '/^[[:space:]]*(let|var)[^:]+:[[:space:]]*Set<String>[[:space:]]*=[[:space:]]*\[/,/^[[:space:]]*\]/p' \
-        "$work_dir/notification-route"
-} | grep -o '"[^"]*"' | tr -d '"' | sort -u > "$work_dir/sdk-notifications"
-jq -r '.oneOf[].properties.method.enum[0] // empty' "$snapshot_dir/ServerNotification.json" \
-    | sort -u > "$work_dir/schema-notifications"
-
-if [[ $notification_anchors_ok -eq 0 ]]; then
-    : # already reported above; the slice below would be unreliable
-elif [[ ! -s "$work_dir/sdk-notifications" ]]; then
-    fail "notifications: routeNotification slice was empty — was the function body changed?"
-else
-    unknown="$(comm -23 "$work_dir/sdk-notifications" "$work_dir/schema-notifications")"
-    if [[ -n "$unknown" ]]; then
-        fail "notifications: the SDK routes methods the schema does not define:"
-        printf '       %s\n' $unknown
-    else
-        pass "notifications: $(wc -l < "$work_dir/sdk-notifications" | tr -d ' ')/$(wc -l < "$work_dir/schema-notifications" | tr -d ' ') schema notifications named, all valid (the rest reach the .notification catch-all)"
-    fi
-fi
-
-# --- (c) CodexItemKind against the ThreadItem discriminator --------------------------------
+# --- (b) CodexItemKind against the ThreadItem discriminator --------------------------------
 sed -n '/public enum CodexItemKind/,/^}/p' "$sources_dir/Models.swift" \
     | grep -o 'case "[^"]*"' | sed 's/case "//; s/"//' | sort -u > "$work_dir/sdk-itemkinds"
 jq -r '.definitions.ThreadItem.oneOf[].properties.type.enum[0] // empty' \
@@ -111,7 +71,7 @@ else
     fi
 fi
 
-# --- (d) the server-request classifier matches by substring, so keep those unambiguous -----
+# --- (c) the server-request classifier matches by substring, so keep those unambiguous -----
 # makeInteraction() in CodexClient.swift classifies with method.contains(...). The moment a new
 # schema method contains one of these substrings, that method is silently misclassified. Fail
 # here instead, and force a choice between exact matching and widening.
