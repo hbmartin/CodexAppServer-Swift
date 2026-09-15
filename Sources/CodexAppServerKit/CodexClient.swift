@@ -124,7 +124,10 @@ public actor CodexClient {
     }
 
     public func subscribe(policy: CodexBufferingPolicy = .default) -> CodexSubscription { makeSubscription(threadID: nil, policy: policy) }
-    public func events(for threadID: String, policy: CodexBufferingPolicy = .default) -> CodexSubscription { makeSubscription(threadID: threadID, policy: policy) }
+    public func events(for threadID: String?, policy: CodexBufferingPolicy = .default) throws -> CodexSubscription {
+        if let threadID, threadID.isEmpty { throw CodexError.invalidArgument("threadID must not be empty") }
+        return makeSubscription(threadID: threadID, policy: policy)
+    }
 
     private func makeSubscription(threadID: String?, policy: CodexBufferingPolicy) -> CodexSubscription {
         let id = UUID()
@@ -354,20 +357,24 @@ public actor CodexClient {
         }
         if method == "fuzzyFileSearch/sessionUpdated" { emit(.fileSearchUpdated(params)); return }
         if method == "fuzzyFileSearch/sessionCompleted" { emit(.fileSearchCompleted(params)); return }
-        if method == "item/started", let raw = params["item"] {
+        if method == "item/started" {
+            guard let raw = params["item"] else { emit(malformed(method, "missing params.item", threadID: threadID)); return }
             guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
             reduceItem(item, threadID: threadID, authoritative: false); emit(.itemStarted(threadID: threadID, item: item)); return
         }
-        if method == "item/completed", let raw = params["item"] {
+        if method == "item/completed" {
+            guard let raw = params["item"] else { emit(malformed(method, "missing params.item", threadID: threadID)); return }
             guard let item = decodeOrReport(method, threadID: threadID, { try CodexItem(raw: raw, turnID: params["turnId"]?.stringValue) }) else { return }
             reduceItem(item, threadID: threadID, authoritative: true); emit(.itemCompleted(threadID: threadID, item: item)); return
         }
-        if method == "turn/started", let raw = params["turn"] {
+        if method == "turn/started" {
+            guard let raw = params["turn"] else { emit(malformed(method, "missing params.turn", threadID: threadID)); return }
             guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
             guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
             reduceTurn(turn, completed: false); emit(.turnStarted(threadID: threadID, turn: turn)); return
         }
-        if method == "turn/completed", let raw = params["turn"] {
+        if method == "turn/completed" {
+            guard let raw = params["turn"] else { emit(malformed(method, "missing params.turn", threadID: threadID)); return }
             guard let threadID else { emit(malformed(method, "missing params.threadId")); return }
             guard let turn = decodeOrReport(method, threadID: threadID, { try CodexTurn(threadID: threadID, raw: raw) }) else { return }
             reduceTurn(turn, completed: true); emit(.turnCompleted(threadID: threadID, turn: turn)); return

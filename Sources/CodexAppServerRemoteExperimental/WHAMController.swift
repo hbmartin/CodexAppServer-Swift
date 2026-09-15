@@ -18,7 +18,7 @@ public struct WHAMPairingGrant: Codable, Sendable, Equatable, Identifiable {
 }
 
 public struct WHAMHost: Sendable, Equatable, Identifiable {
-    public var id: String
+    public let id: String
     public var name: String?
     public var online: Bool?
     public var raw: JSONValue

@@ -173,7 +173,7 @@ private func makeClient(_ transport: CodexScriptedTransport, configuration: Code
     let transport = makeTransport(), client = makeClient(transport); _ = try await client.connect()
     let global = await client.subscribe(policy: .unbounded)
     var subscriptions: [CodexSubscription] = []
-    for index in 0..<9 { subscriptions.append(await client.events(for: "thread-\(index)")) }
+    for index in 0..<9 { subscriptions.append(try await client.events(for: "thread-\(index)")) }
     var iterator = global.events.makeAsyncIterator(); let event = try await iterator.next()
     if case .diagnostic(.highThreadSubscriptionCount(let count)) = event { #expect(count == 9) } else { Issue.record("expected advisory") }
     #expect(subscriptions.count == 9); await client.close()

@@ -44,7 +44,7 @@ public final class CodexConversationDetailModel {
         stopObserving()
         let generation = observationGeneration
         // Subscribe before requesting history so live changes cannot fall into a gap.
-        let subscription = await client.events(for: threadID, policy: .boundedCoalescingDeltas(1_024))
+        let subscription = try await client.events(for: threadID, policy: .boundedCoalescingDeltas(1_024))
         guard observationGeneration == generation else { subscription.cancel(); return }
         self.subscription = subscription
         do {

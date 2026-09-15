@@ -180,14 +180,31 @@ public extension CodexClient {
             let childPath = try roots.validateAbsolutePath(URL(fileURLWithPath: path).appendingPathComponent(name).path)
             return (name, childPath, raw)
         }
-        var entries: [CodexDirectoryEntry] = []
-        for (name, childPath, raw) in children {
-            // 0.146.0 directory entries omit isSymlink; getMetadata reports it without following the link.
-            let metadata = try await rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])
-            guard let isSymlink = metadata["isSymlink"]?.boolValue else { throw CodexError.missingField("metadata.isSymlink") }
-            entries.append(.init(path: childPath, name: name, isDirectory: raw["isDirectory"]?.boolValue ?? false, isSymlink: isSymlink, raw: raw))
+        // 0.146.0 directory entries omit isSymlink; getMetadata reports it without following the link.
+        let maximumConcurrentMetadataRequests = 8
+        var metadata = Array(repeating: JSONValue.null, count: children.count)
+        try await withThrowingTaskGroup(of: (Int, JSONValue).self) { group in
+            var nextIndex = 0
+            while nextIndex < min(maximumConcurrentMetadataRequests, children.count) {
+                let index = nextIndex, childPath = children[index].1
+                group.addTask { (index, try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])) }
+                nextIndex += 1
+            }
+            while let (index, value) = try await group.next() {
+                metadata[index] = value
+                if nextIndex < children.count {
+                    let index = nextIndex, childPath = children[index].1
+                    group.addTask { (index, try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])) }
+                    nextIndex += 1
+                }
+            }
         }
-        return entries
+        return try children.enumerated().map { index, child in
+            let (name, childPath, raw) = child
+            let metadata = metadata[index]
+            guard let isSymlink = metadata["isSymlink"]?.boolValue else { throw CodexError.missingField("metadata.isSymlink") }
+            return .init(path: childPath, name: name, isDirectory: raw["isDirectory"]?.boolValue ?? false, isSymlink: isSymlink, raw: raw)
+        }
     }
     func readFile(path: String, roots: CodexWorkspaceRoots, maximumBytes: Int = 32 * 1_024 * 1_024) async throws -> Data {
         let path = try roots.validateAbsolutePath(path); try await rejectSymlinkComponents(path: path, roots: roots)

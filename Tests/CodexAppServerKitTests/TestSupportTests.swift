@@ -15,7 +15,11 @@ import CodexAppServerTestSupport
     let gate = CodexTestGate()
     async let first: Void = gate.wait()
     async let second: Void = gate.wait()
-    while !(await gate.isWaiting()) { await Task.yield() }
+    for _ in 0..<1_000 {
+        if await gate.waiterCount() == 2 { break }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(await gate.waiterCount() == 2)
     await gate.release()
     _ = await (first, second)
     #expect(await gate.isWaiting() == false)

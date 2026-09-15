@@ -14,6 +14,9 @@ public actor CodexTestGate {
     /// True while at least one waiter is parked on this gate.
     public func isWaiting() -> Bool { !continuations.isEmpty }
 
+    /// The exact number of waiters currently parked on this gate.
+    public func waiterCount() -> Int { continuations.count }
+
     public func wait() async {
         guard !released else { return }
         await withCheckedContinuation { continuations.append($0) }
