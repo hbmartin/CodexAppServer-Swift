@@ -53,7 +53,9 @@ func hostIdentityPrefersServerIDThenHostIDThenID(raw: JSONValue, expected: Strin
 }
 
 @Test func hostCarriesNameAndOnlineFlag() throws {
-    let host = try WHAMHost(raw: ["serverId": "s", "name": "Studio", "online": true])
+    let raw: JSONValue = ["serverId": "s", "name": "Studio", "online": true]
+    let host = try WHAMHost(raw: raw)
+    #expect(host.raw == raw)
     #expect(host.name == "Studio")
     #expect(host.online == true)
 }

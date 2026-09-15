@@ -11,18 +11,21 @@ import CodexAppServerTestSupport
     #expect(await gate.isWaiting() == false)
 }
 
-@Test func testGateReleasesAllWaitersAndResetsWaitingState() async {
+@Test func testGateReleasesAllWaitersAndResetsWaitingState() async throws {
     let gate = CodexTestGate()
     async let first: Void = gate.wait()
     async let second: Void = gate.wait()
-    for _ in 0..<1_000 {
-        if await gate.waiterCount() == 2 { break }
-        try? await Task.sleep(for: .milliseconds(1))
-    }
-    #expect(await gate.waiterCount() == 2)
+    try await gate.waitForWaiters(2)
     await gate.release()
     _ = await (first, second)
     #expect(await gate.isWaiting() == false)
+}
+
+@Test func testGateWaiterTimeoutReportsExpectedAndActualCounts() async {
+    let gate = CodexTestGate()
+    await #expect(throws: CodexTestGateError.timedOut(expectedWaiters: 1, actualWaiters: 0)) {
+        try await gate.waitForWaiters(1, timeout: .zero)
+    }
 }
 
 @Test func scriptedTransportEchoesThreadIDsAndHonorsOverrides() async throws {

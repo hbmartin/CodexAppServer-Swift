@@ -1,6 +1,17 @@
 import Foundation
 import CodexAppServerKit
 
+public enum CodexTestGateError: Error, Sendable, Equatable, LocalizedError {
+    case timedOut(expectedWaiters: Int, actualWaiters: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .timedOut(let expected, let actual):
+            "Timed out waiting for \(expected) gate waiter(s); observed \(actual)."
+        }
+    }
+}
+
 /// A suspension point a test can open on demand.
 ///
 /// Used to hold a transport inside `start()` or inside a chosen request so the test can act
@@ -16,6 +27,19 @@ public actor CodexTestGate {
 
     /// The exact number of waiters currently parked on this gate.
     public func waiterCount() -> Int { continuations.count }
+
+    /// Waits until exactly `expected` callers are parked, or throws a descriptive timeout.
+    public func waitForWaiters(_ expected: Int, timeout: Duration = .seconds(1)) async throws {
+        precondition(expected >= 0)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while continuations.count < expected, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        guard continuations.count == expected else {
+            throw CodexTestGateError.timedOut(expectedWaiters: expected, actualWaiters: continuations.count)
+        }
+    }
 
     public func wait() async {
         guard !released else { return }
@@ -72,7 +96,9 @@ public actor CodexScriptedTransport: CodexTransport {
     private var results: [String: JSONValue]
     private var closedFlag = false
     private let ignoredMethods: Set<String>
-    private let requestHandler: (@Sendable (JSONValue) throws -> JSONValue?)?
+    private let requestHandler: (@Sendable (JSONValue) async throws -> JSONValue?)?
+    private var activeRequestCounts: [String: Int] = [:]
+    private var peakActiveRequestCounts: [String: Int] = [:]
 
     private var delayResponses: Bool
     private var replayOnResume: Bool
@@ -99,7 +125,7 @@ public actor CodexScriptedTransport: CodexTransport {
     ///   - replayOnResume: inject a server request during `thread/resume`, as an app-server
     ///     does when it replays an unanswered approval after a reconnect.
     public init(results: [String: JSONValue] = [:], delayResponses: Bool = false, replayOnResume: Bool = false,
-                ignoredMethods: Set<String> = [], requestHandler: (@Sendable (JSONValue) throws -> JSONValue?)? = nil) {
+                ignoredMethods: Set<String> = [], requestHandler: (@Sendable (JSONValue) async throws -> JSONValue?)? = nil) {
         self.ignoredMethods = ignoredMethods
         self.requestHandler = requestHandler
         self.results = results
@@ -131,13 +157,16 @@ public actor CodexScriptedTransport: CodexTransport {
         if message["result"] != nil, delayResponses { try await Task.sleep(for: .milliseconds(50)) }
         guard let id = message["id"], let method = message["method"]?.stringValue else { return }
         if ignoredMethods.contains(method) { return }
+        activeRequestCounts[method, default: 0] += 1
+        peakActiveRequestCounts[method] = max(peakActiveRequestCounts[method, default: 0], activeRequestCounts[method, default: 0])
+        defer { activeRequestCounts[method, default: 0] -= 1 }
         if let methodGate, methodGate.method == method { await methodGate.gate.wait() }
         if method == "thread/resume", replayOnResume {
             try inject(["id": 55, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
             try await Task.sleep(for: .milliseconds(100))
         }
         let result: JSONValue
-        if let handled = try requestHandler?(message) { result = handled }
+        if let handled = try await requestHandler?(message) { result = handled }
         else if let configured = results[method] { result = configured }
         else if method == "thread/resume" || method == "thread/read" {
             result = ["thread": ["id": message["params"]?["threadId"] ?? "thread-1"]]
@@ -183,6 +212,7 @@ public actor CodexScriptedTransport: CodexTransport {
 
     public func messages() -> [JSONValue] { sent }
     public func isClosed() -> Bool { closedFlag }
+    public func peakActiveRequestCount(method: String) -> Int { peakActiveRequestCounts[method, default: 0] }
 
     /// The JSON-RPC id the client used for the most recent request with this method.
     public func requestID(method: String) -> JSONValue? {

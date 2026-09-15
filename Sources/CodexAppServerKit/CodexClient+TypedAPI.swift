@@ -182,27 +182,44 @@ public extension CodexClient {
         }
         // 0.146.0 directory entries omit isSymlink; getMetadata reports it without following the link.
         let maximumConcurrentMetadataRequests = 8
-        var metadata = Array(repeating: JSONValue.null, count: children.count)
-        try await withThrowingTaskGroup(of: (Int, JSONValue).self) { group in
+        var symlinkFlags = Array<Bool?>(repeating: nil, count: children.count)
+        try await withThrowingTaskGroup(of: Result<(Int, Bool), any Error>.self) { group in
             var nextIndex = 0
-            while nextIndex < min(maximumConcurrentMetadataRequests, children.count) {
-                let index = nextIndex, childPath = children[index].1
-                group.addTask { (index, try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])) }
+            var firstError: (any Error)?
+            func addNext() {
+                let index = nextIndex
                 nextIndex += 1
-            }
-            while let (index, value) = try await group.next() {
-                metadata[index] = value
-                if nextIndex < children.count {
-                    let index = nextIndex, childPath = children[index].1
-                    group.addTask { (index, try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])) }
-                    nextIndex += 1
+                let childPath = children[index].1
+                group.addTask {
+                    do {
+                        let metadata = try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])
+                        guard let isSymlink = metadata["isSymlink"]?.boolValue else {
+                            throw CodexError.missingField("metadata.isSymlink")
+                        }
+                        return .success((index, isSymlink))
+                    } catch {
+                        return .failure(error)
+                    }
                 }
             }
+
+            for _ in 0..<min(maximumConcurrentMetadataRequests, children.count) { addNext() }
+            while let outcome = try await group.next() {
+                switch outcome {
+                case .success(let (index, isSymlink)):
+                    symlinkFlags[index] = isSymlink
+                    if firstError == nil, nextIndex < children.count { addNext() }
+                case .failure(let error):
+                    if firstError == nil { firstError = error }
+                }
+            }
+            if let firstError { throw firstError }
         }
-        return try children.enumerated().map { index, child in
+        return children.enumerated().map { index, child in
             let (name, childPath, raw) = child
-            let metadata = metadata[index]
-            guard let isSymlink = metadata["isSymlink"]?.boolValue else { throw CodexError.missingField("metadata.isSymlink") }
+            guard let isSymlink = symlinkFlags[index] else {
+                preconditionFailure("metadata scheduler completed without a symlink flag")
+            }
             return .init(path: childPath, name: name, isDirectory: raw["isDirectory"]?.boolValue ?? false, isSymlink: isSymlink, raw: raw)
         }
     }

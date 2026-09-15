@@ -42,6 +42,18 @@ private func makeClient(_ transport: CodexScriptedTransport, configuration: Code
     #expect(try CodexItem(raw: ["id": "future", "type": "futureItem", "newField": 1]).kind == .unknown("futureItem"))
 }
 
+@Test func routedNotificationMethodsExistInPinnedSchema() throws {
+    let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let schemaURL = repository.appendingPathComponent("Schemas/0.146.0/ServerNotification.json")
+    let schema = try JSONValue.decode(Data(contentsOf: schemaURL))
+    let schemaMethods = Set((schema["oneOf"]?.arrayValue ?? []).compactMap {
+        $0["properties"]?["method"]?["enum"]?[0]?.stringValue
+    })
+    #expect(!schemaMethods.isEmpty, "ServerNotification schema extraction must not pass vacuously")
+    let routedMethods = Set(RoutedNotificationMethod.allCases.map(\.rawValue))
+    #expect(routedMethods.subtracting(schemaMethods).isEmpty)
+}
+
 @Test func initializeAlwaysEnablesExperimentalAndFormElicitation() async throws {
     let transport = makeTransport(), client = makeClient(transport)
     _ = try await client.connect()
