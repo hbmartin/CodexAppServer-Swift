@@ -3,6 +3,45 @@ import Testing
 import CodexAppServerTestSupport
 @testable import CodexAppServerKit
 
+private struct ReviewEventWaitTimedOut: Error {}
+
+private func boundedValue<Value: Sendable>(
+    of task: Task<Value, Error>,
+    before deadline: ContinuousClock.Instant
+) async throws -> Value {
+    do {
+        return try await withThrowingTaskGroup(of: Value.self) { group in
+            group.addTask {
+                try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+            }
+            group.addTask {
+                try await ContinuousClock().sleep(until: deadline)
+                task.cancel()
+                throw ReviewEventWaitTimedOut()
+            }
+            guard let value = try await group.next() else { throw ReviewEventWaitTimedOut() }
+            group.cancelAll()
+            return value
+        }
+    } catch {
+        task.cancel()
+        _ = await task.result
+        throw error
+    }
+}
+
+@Test func boundedReviewEventWaitCancelsAtDeadline() async {
+    let waiting = Task<Void, Error> { try await Task.sleep(for: .seconds(10)) }
+    await #expect(throws: ReviewEventWaitTimedOut.self) {
+        try await boundedValue(of: waiting, before: ContinuousClock.now + .milliseconds(10))
+    }
+    #expect(waiting.isCancelled)
+}
+
 @Test func reviewCommandOutputDecodesProtocolBytes() throws {
     let output = try CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGVsbG8=", "capReached": false])
     #expect(String(decoding: output.data, as: UTF8.self) == "hello")
@@ -354,8 +393,8 @@ import CodexAppServerTestSupport
     do { try await interaction.response.respond(.answers([:])); Issue.record("retried ambiguous response") }
     catch { #expect(error as? CodexError == .responseAlreadySent) }
     #expect(await first.messages().filter { $0["id"] == 44 && $0["result"] != nil }.count == 1)
+    #expect(await first.isClosed())
 
-    await first.finish(CodexError.transportClosed("drop after ambiguous response"))
     for _ in 0..<2_000 {
         if case .recoveryRequired = await client.connectionState() { break }
         await Task.yield()
@@ -366,9 +405,20 @@ import CodexAppServerTestSupport
     #expect(recovery.unscopedRequestIDs == [44])
 
     try await second.inject(["id": 44, "method": "account/request", "params": [:]])
-    var replayed: CodexPendingInteraction?
-    while replayed == nil, let event = try await iterator.next() {
-        if case .serverRequest(let interaction) = event { replayed = interaction }
+    var replayIterator = iterator
+    let replayTask = Task { () throws -> CodexPendingInteraction? in
+        while let event = try await replayIterator.next() {
+            if case .serverRequest(let interaction) = event { return interaction }
+        }
+        return nil
+    }
+    let replayed: CodexPendingInteraction?
+    do {
+        replayed = try await boundedValue(of: replayTask, before: ContinuousClock.now + .seconds(2))
+    } catch is ReviewEventWaitTimedOut {
+        Issue.record("missing replay event before deadline")
+        await client.close()
+        return
     }
     let replayedInteraction = try #require(replayed)
     #expect(replayedInteraction.generation != interaction.generation)
