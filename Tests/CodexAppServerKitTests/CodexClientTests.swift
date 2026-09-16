@@ -149,7 +149,7 @@ private func makeClient(_ transport: CodexScriptedTransport, configuration: Code
 @Test func mediaAndWorkspaceValidation() throws {
     let data = Data([0, 1, 2]); #expect(try CodexMedia.dataURL(data: data, mimeType: "image/png") == "data:image/png;base64,AAEC")
     #expect(throws: CodexError.self) { try CodexMedia.dataURL(data: data, mimeType: "image/png", limit: 2) }
-    let roots = CodexWorkspaceRoots([URL(fileURLWithPath: "/work")]); #expect(try roots.validateAbsolutePath("/work/a.swift") == "/work/a.swift")
+    let roots = try CodexWorkspaceRoots([URL(fileURLWithPath: "/work")]); #expect(try roots.validateAbsolutePath("/work/a.swift") == "/work/a.swift")
     #expect(throws: CodexError.self) { try roots.validateAbsolutePath("/etc/passwd") }
 }
 

@@ -20,11 +20,11 @@ func directoryListingIdentifiesRealServerSymlinks() async throws {
     let client = CodexClient(transportFactory: factory, configuration: .init(requestTimeout: .seconds(5), reconnectPolicy: .init(maximumAttempts: 0)))
     do {
         _ = try await client.connect()
-        let entries = try await client.listDirectory(path: workspace.path, roots: .init([workspace]))
-        #expect(entries.count == 2)
-        #expect(entries.first { $0.name == "link.txt" }?.isSymlink == true)
-        #expect(entries.first { $0.name == "plain.txt" }?.isSymlink == false)
-        #expect(entries.allSatisfy { $0.raw["isSymlink"] == nil })
+        let listing = try await client.listDirectory(path: workspace.path, roots: try .init([workspace]), detail: .detailed)
+        #expect(listing.entries.count == 2)
+        #expect(listing.entries.first { $0.name == "link.txt" }?.symlinkStatus == .symlink)
+        #expect(listing.entries.first { $0.name == "plain.txt" }?.symlinkStatus == .notSymlink)
+        #expect(listing.entries.allSatisfy { $0.raw["isSymlink"] == nil })
     } catch {
         await client.close()
         throw error
@@ -65,6 +65,29 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     let alive = Darwin.kill(pid, 0) == 0
     if alive { _ = Darwin.kill(pid, SIGKILL) }
     #expect(!alive)
+}
+
+@Test func processTransportPreservesHighVolumeStdoutFrameOrder() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = directory.appendingPathComponent("ordered-output.py")
+    let source = """
+    #!/usr/bin/python3
+    import json
+    for sequence in range(10000):
+        print(json.dumps({"sequence": sequence}), flush=False)
+    """
+    try source.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
+    try await transport.start()
+    var received: [Int] = []
+    for try await frame in transport.incomingFrames {
+        received.append(try JSONValue.decode(frame)["sequence"]!.intValue!)
+    }
+    #expect(received == Array(0..<10000))
+    await transport.close()
 }
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["RUN_CODEX_PROCESS_TESTS"] == "1"))

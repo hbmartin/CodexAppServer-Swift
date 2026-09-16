@@ -49,7 +49,22 @@ public extension JSONValue {
     var stringValue: String? { if case .string(let value) = self { value } else { nil } }
     var boolValue: Bool? { if case .bool(let value) = self { value } else { nil } }
     var decimalValue: Decimal? { if case .number(let value) = self { value } else { nil } }
-    var intValue: Int? { decimalValue.map { NSDecimalNumber(decimal: $0).intValue } }
+    /// Returns an integer only when the JSON number is integral and exactly representable by `Int`.
+    var intValue: Int? {
+        guard let value = int64Value else { return nil }
+        return Int(exactly: value)
+    }
+    /// Returns an integer only when the JSON number is integral and exactly representable by `Int64`.
+    var int64Value: Int64? {
+        guard let decimal = decimalValue else { return nil }
+        let value = NSDecimalNumber(decimal: decimal).int64Value
+        guard Decimal(value) == decimal else { return nil }
+        return value
+    }
+    var uint32Value: UInt32? {
+        guard let value = int64Value else { return nil }
+        return UInt32(exactly: value)
+    }
     /// The first non-empty string among `keys`, tried in order.
     ///
     /// Identity fields are read through this accessor so that an absent key, a null, a
@@ -60,6 +75,14 @@ public extension JSONValue {
     func requireString(_ keys: String..., context: String) throws -> String {
         for key in keys { if let value = self[key]?.stringValue, !value.isEmpty { return value } }
         throw CodexError.missingField("\(context).\(keys.joined(separator: "|"))")
+    }
+    func requireBool(_ key: String, context: String) throws -> Bool {
+        guard let value = self[key]?.boolValue else { throw CodexError.invalidField("\(context).\(key)") }
+        return value
+    }
+    func requireInt64(_ key: String, context: String) throws -> Int64 {
+        guard let value = self[key]?.int64Value else { throw CodexError.invalidField("\(context).\(key)") }
+        return value
     }
     func encoded(sortedKeys: Bool = false) throws -> Data {
         let encoder = JSONEncoder()

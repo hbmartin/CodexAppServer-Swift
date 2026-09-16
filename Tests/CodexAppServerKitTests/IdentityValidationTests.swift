@@ -179,104 +179,86 @@ import CodexAppServerTestSupport
     await client.close()
 }
 
-// MARK: - Directory entries use the pinned schema and per-child metadata
+// MARK: - Directory entries use the pinned schema and optional per-child metadata
 
-@Test func directoryListingReadsSymlinkFlagsFromMetadata() async throws {
+private func metadata(_ path: String, symlink: Bool = false) -> JSONValue {
+    [
+        "isDirectory": .bool(path == "/tmp/workspace"),
+        "isFile": .bool(path != "/tmp/workspace"),
+        "isSymlink": .bool(symlink),
+        "createdAtMs": 100,
+        "modifiedAtMs": 200,
+    ]
+}
+
+@Test func basicDirectoryListingUsesOneDirectoryRPCAndLeavesMetadataUnknown() async throws {
     let root = URL(fileURLWithPath: "/tmp/workspace")
     let listing: JSONValue = ["entries": [
         ["fileName": "plain.txt", "isDirectory": false, "isFile": true],
         ["fileName": "link.txt", "isDirectory": false, "isFile": true],
     ]]
-    let transport = CodexScriptedTransport(results: [
-        "fs/getMetadata": ["isDirectory": true, "isFile": false, "isSymlink": false],
-        "fs/readDirectory": listing,
-    ], requestHandler: { request in
+    let transport = CodexScriptedTransport(results: ["fs/readDirectory": listing], requestHandler: { request in
         guard request["method"] == "fs/getMetadata", let path = request["params"]?["path"]?.stringValue else { return nil }
-        return ["isDirectory": .bool(path == "/tmp/workspace"), "isFile": .bool(path != "/tmp/workspace"), "isSymlink": .bool(path.hasSuffix("/link.txt"))]
+        return metadata(path)
     })
     let client = try await CodexClient.connectedTestClient(transport)
-    let entries = try await client.listDirectory(path: "/tmp/workspace", roots: .init([root]))
-    #expect(entries.count == 2)
-    let metadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(metadataPaths.first == "/tmp/workspace")
-    #expect(metadataPaths.count == 3)
-    #expect(metadataPaths.dropFirst().sorted() == ["/tmp/workspace/link.txt", "/tmp/workspace/plain.txt"])
-    #expect(entries.first(where: { $0.name == "link.txt" })?.isSymlink == true)
-    #expect(entries.first(where: { $0.name == "plain.txt" })?.isSymlink == false)
+    let result = try await client.listDirectory(path: root.path, roots: try .init([root]))
+    #expect(result.entries.map(\.name) == ["plain.txt", "link.txt"])
+    #expect(result.entries.allSatisfy { $0.symlinkStatus == .unknown && $0.metadataRaw == nil })
+    let methods = await transport.messages().compactMap { $0["method"]?.stringValue }
+    #expect(methods.filter { $0 == "fs/getMetadata" }.count == 1)
+    #expect(methods.filter { $0 == "fs/readDirectory" }.count == 1)
     await client.close()
 }
 
-@Test func directoryMetadataRequestsAreBoundedAndResultsPreserveChildOrder() async throws {
+@Test func detailedDirectoryMetadataRequestsAreBoundedAndPreserveChildOrder() async throws {
     let root = URL(fileURLWithPath: "/tmp/workspace")
     let names = (0..<10).map { "child-\($0)" }
-    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false] })])
+    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false, "isFile": true] })])
     let transport = CodexScriptedTransport(results: ["fs/readDirectory": listing], requestHandler: { request in
-        guard request["method"] == "fs/getMetadata" else { return nil }
-        return ["isDirectory": false, "isFile": true, "isSymlink": false]
+        guard request["method"] == "fs/getMetadata", let path = request["params"]?["path"]?.stringValue else { return nil }
+        return metadata(path, symlink: path.hasSuffix("child-1"))
     })
     let client = try await CodexClient.connectedTestClient(transport)
     let directoryGate = CodexTestGate(), metadataGate = CodexTestGate()
     await transport.hold(method: "fs/readDirectory", at: directoryGate)
-    let listingTask = Task { try await client.listDirectory(path: root.path, roots: .init([root])) }
+    let roots = try CodexWorkspaceRoots([root])
+    let listingTask = Task { try await client.listDirectory(path: root.path, roots: roots, detail: .metadata(maximumConcurrentRequests: 4)) }
 
     try await directoryGate.waitForWaiters(1, timeout: .seconds(5))
     await transport.hold(method: "fs/getMetadata", at: metadataGate)
     await directoryGate.release()
-    try await metadataGate.waitForWaiters(8, timeout: .seconds(5))
-    let heldMetadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(heldMetadataPaths.count == 9, "root validation plus exactly eight child requests should be sent")
+    try await metadataGate.waitForWaiters(4, timeout: .seconds(5))
+    #expect(await transport.peakActiveRequestCount(method: "fs/getMetadata") == 4)
     await metadataGate.release()
 
-    let entries = try await listingTask.value
-    #expect(entries.map(\.name) == names)
-    let metadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(metadataPaths.count == names.count + 1)
-    #expect(metadataPaths.first == root.path)
-    #expect(metadataPaths.dropFirst().sorted() == names.map { root.appendingPathComponent($0).path }.sorted())
-    #expect(await transport.peakActiveRequestCount(method: "fs/getMetadata") == 8)
+    let result = try await listingTask.value
+    #expect(result.entries.map(\.name) == names)
+    #expect(result.entries.first { $0.name == "child-1" }?.symlinkStatus == .symlink)
+    #expect(result.entries.allSatisfy { $0.createdAtMilliseconds == 100 && $0.modifiedAtMilliseconds == 200 })
+    #expect(result.diagnostics.isEmpty)
     await client.close()
 }
 
-@Test func malformedDirectoryMetadataStopsRefillingDrainsSiblingsAndPreservesFirstError() async throws {
+@Test func detailedDirectoryListingReportsPerChildMetadataFailuresAndContinues() async throws {
     let root = URL(fileURLWithPath: "/tmp/workspace")
-    let names = (0..<5_000).map { "child-\($0)" }
-    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false] })])
-    let siblingGate = CodexTestGate()
+    let names = (0..<20).map { "child-\($0)" }
+    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false, "isFile": true] })])
     let transport = CodexScriptedTransport(results: ["fs/readDirectory": listing], requestHandler: { request in
         guard request["method"] == "fs/getMetadata", let path = request["params"]?["path"]?.stringValue else { return nil }
-        if path == root.path { return ["isDirectory": true, "isFile": false, "isSymlink": false] }
         if path.hasSuffix("/child-0") { return ["isDirectory": false, "isFile": true] }
-        await siblingGate.wait()
-        if path.hasSuffix("/child-1") {
-            try await Task.sleep(for: .milliseconds(10))
-            throw CodexError.rpc(code: -32_603, message: "later failure", data: nil)
-        }
-        return ["isDirectory": false, "isFile": true, "isSymlink": false]
+        if path.hasSuffix("/child-1") { throw CodexError.rpc(code: -32_603, message: "metadata unavailable", data: nil) }
+        return metadata(path)
     })
     let client = try await CodexClient.connectedTestClient(transport)
-    let global = await client.subscribe(policy: .unbounded)
-    let listingTask = Task { try await client.listDirectory(path: root.path, roots: .init([root])) }
-
-    try await siblingGate.waitForWaiters(7, timeout: .seconds(10))
-    let heldMetadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(heldMetadataPaths.count == 9, "malformed metadata must stop the scheduler after its initial batch")
-    await siblingGate.release()
-
-    do {
-        _ = try await listingTask.value
-        Issue.record("expected the first malformed metadata response to fail the listing")
-    } catch {
-        #expect(error as? CodexError == .missingField("metadata.isSymlink"))
-    }
-    let finalMetadataPaths = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.compactMap { $0["params"]?["path"]?.stringValue }
-    #expect(finalMetadataPaths.count == 9)
+    let result = try await client.listDirectory(path: root.path, roots: try .init([root]), detail: .metadata(maximumConcurrentRequests: 8))
+    #expect(result.entries.map(\.name) == names)
+    #expect(result.diagnostics.map(\.path).sorted() == [root.appendingPathComponent("child-0").path, root.appendingPathComponent("child-1").path])
+    #expect(result.entries[0].symlinkStatus == .unknown)
+    #expect(result.entries[2].symlinkStatus == .notSymlink)
     #expect(await transport.peakActiveRequestCount(method: "fs/getMetadata") <= 8)
-
-    let marker = CodexEvent.notification(method: "test/marker", params: ["value": true])
-    try await transport.inject(["method": "test/marker", "params": ["value": true]])
-    var iterator = global.events.makeAsyncIterator()
-    #expect(try await iterator.next() == marker, "drained sibling responses must not become unmatched diagnostics")
-    global.cancel(); await client.close()
+    #expect(await transport.messages().filter { $0["method"] == "fs/getMetadata" }.count == names.count + 1)
+    await client.close()
 }
 
 @Test(arguments: ["thread/turns/list", "thread/items/list"])
