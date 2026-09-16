@@ -84,10 +84,139 @@ import CodexAppServerTestSupport
     let client = try await CodexClient.connectedTestClient(transport)
     await client.reduceTurn(try .init(threadID: "t", raw: ["id": "u", "status": "inProgress"]), completed: false)
     _ = try await client.readThread(id: "t", includeTurns: true)
-    #expect(await client.turnStatus(threadID: "t", turnID: "u") == "completed")
+    #expect(await client.turnStatus(threadID: "t", turnID: "u") == .completed)
     #expect(await client.state(for: "t")?.activeTurnIDs.isEmpty == true)
     #expect(await client.state(for: "t")?.items["i"]?.turnID == "u")
     await client.close()
+}
+
+@Test func terminalTurnNotificationWinsOverLateStartAcknowledgement() async throws {
+    let transport = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults, ignoredMethods: ["turn/start"])
+    let client = try await CodexClient.connectedTestClient(transport)
+    let request = Task { try await client.startTurn(threadID: "t", prompt: "hello") }
+    while await transport.requestID(method: "turn/start") == nil { await Task.yield() }
+    let requestID = try #require(await transport.requestID(method: "turn/start"))
+    try await transport.inject(["method": "turn/completed", "params": ["threadId": "t", "turn": ["id": "u", "status": "completed"]]])
+    try await transport.inject(["id": requestID, "result": ["turn": ["id": "u", "status": "inProgress"]]])
+    _ = try await request.value
+    #expect(await client.turnStatus(threadID: "t", turnID: "u") == .completed)
+    #expect(await client.state(for: "t")?.activeTurnIDs.contains("u") == false)
+    await client.close()
+}
+
+@Test func rawProtocolEventsAreOptInAndPreserveTheOriginalEnvelope() async throws {
+    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
+    let typed = await client.subscribe(policy: .unbounded)
+    let raw = await client.subscribe(policy: .unbounded, includesProtocolMessages: true)
+    let envelope: JSONValue = ["method": "future/event", "params": ["threadId": "t", "future": 7]]
+    try await transport.inject(envelope)
+    var typedIterator = typed.events.makeAsyncIterator(), rawIterator = raw.events.makeAsyncIterator()
+    #expect(try await typedIterator.next() == .notification(method: "future/event", params: envelope["params"]!))
+    #expect(try await rawIterator.next() == .protocolMessage(envelope))
+    #expect(try await rawIterator.next() == .notification(method: "future/event", params: envelope["params"]!))
+    typed.cancel(); raw.cancel(); await client.close()
+}
+
+@Test func exactIntegerAccessorsRejectFractionsAndOverflow() throws {
+    #expect(JSONValue.number(Decimal(string: "1.5")!).intValue == nil)
+    #expect(JSONValue.number(Decimal(string: "9223372036854775808")!).int64Value == nil)
+    #expect(JSONValue.number(Decimal(Int64.max)).int64Value == Int64.max)
+    #expect(JSONValue.number(-1).uint32Value == nil)
+    #expect(JSONValue.number(Decimal(UInt32.max)).uint32Value == UInt32.max)
+}
+
+@Test func pagingUsesTypedSortValuesPreservesBothCursorsAndRejectsInvalidLimitsLocally() async throws {
+    let transport = CodexScriptedTransport(results: [
+        "thread/list": ["data": [], "nextCursor": "newer", "backwardsCursor": "older"],
+        "thread/turns/list": ["data": [], "backwardsCursor": "turn-older"],
+    ])
+    let client = try await CodexClient.connectedTestClient(transport)
+    let threads = try await client.listThreads(.init(limit: 50, sortKey: .recencyAt, sortDirection: .descending))
+    #expect(threads.nextCursor == "newer" && threads.backwardsCursor == "older")
+    let turns = try await client.listTurns(threadID: "t", limit: 10, itemView: .full, sortDirection: .ascending)
+    #expect(turns.backwardsCursor == "turn-older")
+    let messages = await transport.messages()
+    let threadRequest = messages.last { $0["method"] == "thread/list" }
+    #expect(threadRequest?["params"]?["sortKey"] == "recency_at")
+    #expect(threadRequest?["params"]?["sortDirection"] == "desc")
+    let turnRequest = messages.last { $0["method"] == "thread/turns/list" }
+    #expect(turnRequest?["params"]?["itemsView"] == "full")
+    #expect(turnRequest?["params"]?["sortDirection"] == "asc")
+    let before = messages.count
+    await #expect(throws: CodexError.invalidArgument("limit must fit an unsigned 32-bit integer")) {
+        _ = try await client.listThreads(.init(limit: -1))
+    }
+    #expect(await transport.messages().count == before)
+    await client.close()
+}
+
+@Test func commandOutputRejectsWrongTypesAndInvalidBase64() {
+    #expect(throws: CodexError.invalidField("commandOutput.stream")) {
+        try CodexCommandOutput(raw: ["processId": "p", "stream": 1, "deltaBase64": "aGk=", "capReached": false])
+    }
+    #expect(throws: CodexError.invalidField("commandOutput.deltaBase64")) {
+        try CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "%%%", "capReached": false])
+    }
+    #expect(throws: CodexError.invalidField("commandOutput.capReached")) {
+        try CodexCommandOutput(raw: ["processId": "p", "stream": "stdout", "deltaBase64": "aGk=", "capReached": 0])
+    }
+}
+
+@Test func unscopedLostInteractionRequiresExplicitAcknowledgementWhileReadsRemainAvailable() async throws {
+    let first = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let second = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let sequence = CodexTransportSequence([first, second])
+    let client = CodexClient(transportFactory: sequence.factory, configuration: CodexClient.immediateReconnectConfiguration)
+    _ = try await client.connect()
+    try await first.inject(["id": "global-request", "method": "account/request", "params": [:]])
+    while await client.connectionState() != .connected(generation: 1) { await Task.yield() }
+    await first.finish(CodexError.transportClosed("drop"))
+    var context: CodexRecoveryContext?
+    for _ in 0..<2_000 {
+        if case .recoveryRequired(let value) = await client.connectionState() { context = value; break }
+        await Task.yield()
+    }
+    #expect(context?.unscopedRequestIDs == ["global-request"])
+    _ = try await client.listModels()
+    await #expect(throws: CodexError.operationUnavailableDuringRecovery("thread/start")) {
+        _ = try await client.startThread()
+    }
+    try await client.acknowledgeLostInteractions(ids: ["global-request"])
+    #expect(await client.connectionState() == .connected(generation: 2))
+    await client.close()
+}
+
+@Test func explicitAndStreamSubscriptionIntentsHaveIndependentLifetimes() async throws {
+    let first = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let second = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let sequence = CodexTransportSequence([first, second])
+    let client = CodexClient(transportFactory: sequence.factory, configuration: CodexClient.immediateReconnectConfiguration)
+    _ = try await client.connect()
+    _ = try await client.subscribeThread(id: "explicit")
+    let temporary = try await client.events(for: "temporary")
+    temporary.cancel()
+    for _ in 0..<100 { await Task.yield() }
+    await first.finish(CodexError.transportClosed("drop"))
+    for _ in 0..<2_000 {
+        if await client.connectionState() == .connected(generation: 2) { break }
+        await Task.yield()
+    }
+    let restored = await second.messages().filter { $0["method"] == "thread/resume" }.compactMap { $0["params"]?["threadId"]?.stringValue }
+    #expect(restored == ["explicit"])
+    await client.close()
+}
+
+@Test func dequeEventBufferHandlesLargeOrderedBacklog() async throws {
+    let count = 100_000
+    let buffer = CodexEventBuffer(policy: .unbounded, maximumCoalescedBytes: 1024, onTermination: {})
+    for index in 0..<count {
+        #expect(buffer.yield(.notification(method: "event", params: ["index": .number(Decimal(index))])))
+    }
+    for index in 0..<count {
+        guard case .notification(_, let params) = try await buffer.next() else { Issue.record("missing queued event"); return }
+        #expect(params["index"]?.intValue == index)
+    }
+    buffer.finish()
 }
 
 @Test func reviewDeltaCoalescingPreservesAppendedText() async throws {

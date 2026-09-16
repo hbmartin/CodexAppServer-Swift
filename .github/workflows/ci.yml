@@ -27,7 +27,7 @@ jobs:
           xcodebuild docbuild -scheme CodexAppServerKit -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
           xcodebuild docbuild -scheme CodexAppServerHost -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
           xcodebuild docbuild -scheme CodexAppServerObservation -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
-          xcodebuild docbuild -scheme CodexAppServerRemoteExperimental -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+          xcodebuild docbuild -scheme CodexAppServerRemote -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
       - name: Check 0.2.x API compatibility
         if: github.event_name == 'pull_request'
         run: |
@@ -39,12 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build iOS SDK products
-        run: >-
-          xcodebuild build
-          -scheme CodexAppServerKit
-          -destination 'generic/platform=iOS'
-          CODE_SIGNING_ALLOWED=NO
-          SWIFT_STRICT_CONCURRENCY=complete
+        run: |
+          xcodebuild build \
+            -scheme CodexAppServerKit \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_STRICT_CONCURRENCY=complete
+          xcodebuild build \
+            -scheme CodexAppServerRemote \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_STRICT_CONCURRENCY=complete
       - name: Test iOS simulator adapters
         run: >-
           xcodebuild test

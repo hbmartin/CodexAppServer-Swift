@@ -119,7 +119,7 @@ func invalidNotificationConfigurationsAreRejected(source: String) {
     #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config"]) }
     #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config", ""]) }
     #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config", "a", "--notify-config", "b"]) }
-    #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["status", "--notify-config", "notify.json"]) }
+    #expect(try CodexAppServerCLI.notificationConfigurationPath(in: ["status", "--notify-config", "notify.json"]) == "notify.json")
 }
 
 @Test(arguments: [

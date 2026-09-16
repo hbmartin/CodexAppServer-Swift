@@ -2,15 +2,15 @@
 
 `CodexAppServerSDK` 0.2.0 is a Swift 6.2 SDK for building interactive Codex clients on macOS 15+ and iOS 26+. It speaks the Codex app-server protocol directly: tasks (protocol “threads”), turns, streamed items, approvals, questions, tools, reconnect recovery, and raw forward-compatible messages.
 
-This is a clean break from the former `CodexAppSDK` API. No release is tagged yet, so the public API is still moving. From the first `0.2.x` tag onward, source compatibility will be promised for public APIs across patch releases, excluding `CodexAppServerRemoteExperimental`; CI enforces that promise with `swift package diagnose-api-breaking-changes` against the latest tag.
+This is a clean break from the former `CodexAppSDK` API. No release is tagged yet, so the public API is still moving. From the first `0.2.x` tag onward, source compatibility will be promised for public APIs across patch releases; CI enforces that promise with `swift package diagnose-api-breaking-changes` against the latest tag.
 
 ## Products
 
 - `CodexAppServerKit` — transport protocol, actor RPC engine, typed operations, WSS, event reduction, interactions, dynamic tools, media, read-only filesystem helpers, and `client.raw`.
 - `CodexAppServerHost` — macOS-only CLI discovery, daemon lifecycle, isolated stdio, SSH proxy, and SSH WebSocket forwarding.
 - `CodexAppServerObservation` — main-actor `@Observable` models and equivalent Combine publishers. It intentionally has no views, navigation, persistence, host registry, or drafts.
-- `CodexAppServerRemoteExperimental` — unsupported private WHAM controller research surface. It is never re-exported by the main SDK.
-- `codex-app-server-cli` — an interactive, flag-driven reference client for macOS.
+- `CodexAppServerRemote` — supported Swift API for host discovery, pairing, device-bound controller authorization, and Remote Control transports. The upstream service remains experimental.
+- `codex-app-server-cli` — an ArgumentParser command tree with interactive text and versioned JSONL modes for macOS.
 
 ## Installation and first connection
 
@@ -106,7 +106,7 @@ let registry = CodexDynamicToolRegistry(tools: [
 
 `CodexMedia.image` and `.audio` accept client-device `Data` plus MIME type and encode a data URL. The default limit is 10 MiB. Host-local image/audio inputs use paths interpreted on the app-server host.
 
-Read-only filesystem helpers require declared absolute task workspace roots. The SDK normalizes paths, rejects `..`, checks each path component the server reports as a symlink, and caps decoded file responses. App-server permissions remain the final authority. Protocol frames default to a 32 MiB cap.
+Read-only filesystem helpers require declared absolute task workspace roots. The SDK normalizes paths, rejects `..`, checks each path component the server reports as a symlink, and caps decoded file responses. Basic directory listings use one directory RPC after path validation and mark per-child symlink metadata as unknown. Request `.detailed` or `.metadata(maximumConcurrentRequests:)` to enrich children with bounded, best-effort metadata requests and per-entry diagnostics. App-server permissions remain the final authority. Protocol frames default to a 32 MiB cap.
 
 ## WSS and SSH security
 
@@ -130,33 +130,54 @@ Supported deployments are (a) the Unix daemon behind a caller-managed authentica
 
 System SSH always uses `BatchMode=yes` and normal known-host enforcement. Pass an existing host alias or structured hostname/user/port/identity settings. Only a conservative allowlist of extra OpenSSH options is accepted. SSH forwarding requires OpenSSH 8.7 or newer, or a compatible client that supports `ForkAfterAuthentication`.
 
-## Experimental WHAM controller
+## Remote Control
 
-`CodexAppServerRemoteExperimental` can parse PIN/QR payloads, claim pairings, list hosts, build controller transports, and revoke application-stored grants. It implements protocol-v2 sequence cursors, duplicate suppression, reconnect cursors, bounded sends, and ping handling. Production ChatGPT is the default endpoint; tests can inject another endpoint.
+`CodexAppServerRemote` lists Remote Control environments, claims manual pairing codes for an enrolled controller, and creates protocol-v3 app-server transports. The transport validates the service's device-key challenge before sending app traffic, segments large messages, bounds send backpressure, and diagnoses duplicate or gapped stream sequences.
 
-This uses private, undocumented service endpoints. Exact controller routes and envelopes may change without notice. It is unsupported, excluded from 0.2.x compatibility, and should be feature-gated. The SDK never stores grants or account tokens. Apps provide both credential and grant-storage protocols. On macOS, `WHAMCodexAuthFileCredentialProvider` is an explicit opt-in for a caller-selected file; there is no silent file probing, cookie extraction, or iOS auto-detection.
+```swift
+import CodexAppServerRemote
+
+let credentials = try CodexRemoteCodexLoginCredentialProvider()
+let authorization = MyDeviceBoundRemoteAuthorizationProvider()
+let controller = CodexRemoteController(
+    credentials: credentials,
+    authorizationProvider: authorization
+)
+_ = try await controller.pair(try .init(qrPayload: scannedCode))
+let listing = try await controller.listHosts()
+guard let environment = listing.hosts.first(where: { $0.online == true }) else { return }
+let session = try await controller.connect(environmentID: environment.id)
+let tasks = try await session.client.listThreads(.init(limit: 20))
+await session.close()
+```
+
+An account login is sufficient for environment discovery. Pairing and connections additionally require an enrolled controller session and device-key signer supplied through `CodexRemoteClientAuthorizationProvider`; the provider owns step-up enrollment, protected-key persistence, token refresh, and proof generation. The SDK does not reuse another application's enrollment. The supported API deliberately contains no public `WHAM` names even though the manual-pair operation currently uses that hidden service route. Safe reads use bounded retries; mutations are never retried because delivery may be ambiguous. Secrets have redacted descriptions and reflection, and `CodexRemoteCodexLoginCredentialProvider` rereads the selected login file for each credential request.
 
 ## Reference CLI
 
 ```text
-codex-app-server-cli prepare
-codex-app-server-cli status
-codex-app-server-cli --isolated
-codex-app-server-cli --daemon
-codex-app-server-cli --ssh-proxy my-host-alias
-codex-app-server-cli --ssh-forward my-host --local-port 4501 --remote-port 4500
-codex-app-server-cli --daemon --notify-config ./codex-notifications.json
-codex-app-server-cli --wss wss://codex.example.com \
+codex-app-server-cli daemon prepare
+codex-app-server-cli daemon status --json
+codex-app-server-cli connect isolated
+codex-app-server-cli connect daemon --notify-config ./codex-notifications.json
+codex-app-server-cli connect ssh-proxy my-host-alias
+codex-app-server-cli connect ssh-forward my-host --local-port 4501 --remote-port 4500
+codex-app-server-cli connect wss wss://codex.example.com \
   --app-bearer-env CODEX_APP_BEARER \
   --tunnel-header CF-Access-Client-Secret \
   --tunnel-env CODEX_TUNNEL_SECRET
+codex-app-server-cli remote pair --authorization-helper ./remote-auth-helper
+codex-app-server-cli remote hosts --json
+codex-app-server-cli remote connect ENVIRONMENT_ID \
+  --authorization-helper ./remote-auth-helper --json
+codex-app-server-cli remote remove ENVIRONMENT_ID
 ```
 
-Secrets are accepted only through named environment/provider sources, never literal secret flags. The CLI stores no hosts.
+Secrets are accepted only through named environment/provider sources, the authorization helper's stdin, or a securely prompted pairing code, never literal secret flags. Interactive `--json` mode reads schema-versioned commands from stdin and writes correlated results, stable errors, lifecycle records, diagnostics, and exact inbound server request/notification envelopes as JSONL. The helper protocol and full integration procedure are documented in [`docs/testing.md`](docs/testing.md).
 
 ### HTTP notifications
 
-Interactive sessions can send best-effort HTTP notifications when a turn ends or Codex is waiting for a human response. Pass one JSON configuration with `--notify-config FILE`; lifecycle commands such as `status` and `restart` do not accept this option. Relative paths are resolved from the directory where the CLI was launched, and requests originate from that Mac.
+Interactive sessions can send best-effort HTTP notifications when a turn ends or Codex is waiting for a human response. Pass one JSON configuration with `--notify-config FILE`. Relative paths are resolved from the directory where the CLI was launched, and requests originate from that Mac.
 
 ```json
 {
@@ -188,17 +209,19 @@ Typed list methods retain valid entries and pagination cursors when individual e
 
 `startThread`, `forkThread`, `startTurn`, and `steerTurn` throw `CodexError.invalidMutationResponse` if the server acknowledges the operation but its result cannot be decoded. The error includes the method and raw response for reconciliation. The operation may already have taken effect: inspect the server's thread/turn state before deciding whether to retry. Timeouts, cancellation, and transport failures can also leave delivery uncertain. The SDK does not automatically retry these mutations.
 
-Directory listings obtain each child's symlink flag using `fs/getMetadata`, since the pinned `fs/readDirectory` entry schema does not include it. This requires one additional metadata request per child.
+Detailed directory listings obtain each child's symlink flag and timestamps using `fs/getMetadata`, since the pinned `fs/readDirectory` entry schema does not include them. Failures are returned as per-child diagnostics while successful entries retain their metadata.
 
 ## Logging, tests, and schema drift
 
 Structured logging is silent by default and accepts an application sink. Payloads are redacted by default. Full-payload mode may include prompts, paths, commands, and output; credential-shaped fields remain redacted in all modes.
 
 ```sh
-swift test
+swift test -Xswiftc -strict-concurrency=complete
 Scripts/check-sdk-schema-conformance.sh   # does the SDK still match the pinned snapshot?
 Scripts/check-schema-drift.sh             # has upstream moved away from the snapshot?
 ```
+
+The complete test matrix, procedures, environment flags, Remote Control harness, and live-test side effects are documented in [`docs/testing.md`](docs/testing.md).
 
 The reviewed CLI 0.146.0 snapshot is in `Schemas/0.146.0`. CI regenerates it with the pinned CLI and fails on any difference, builds macOS 15 and iOS 26, enforces Swift 6 strict concurrency, builds DocC for every library target, and compares API compatibility against the latest 0.2.x tag. A weekly job additionally audits the snapshot against `codex@latest` as an early warning that upstream has moved.
 
@@ -208,6 +231,12 @@ Authenticated local tests are opt-in. Any test that starts a model turn must set
 
 ```sh
 RUN_CODEX_LIVE_TESTS=1 CODEX_LUNA_MODEL=gpt-5.6-luna swift test --filter authenticatedLuna
+```
+
+The Remote Control smoke test starts an isolated production host and verifies that the SDK discovers that exact environment as online. Pairing, segmentation, and device-key proof are covered by real loopback WebSocket tests; production pairing requires an embedding application's step-up enrollment and protected signer.
+
+```sh
+Scripts/run-remote-control-live-tests.sh
 ```
 
 Unit/build/schema tests do not invoke a model.

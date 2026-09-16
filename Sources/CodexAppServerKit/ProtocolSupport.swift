@@ -5,8 +5,9 @@ public enum CodexError: Error, Sendable, Equatable {
     case transportClosed(String?), malformedFrame(String), frameTooLarge(actual: Int, limit: Int)
     case rpc(code: Int, message: String, data: JSONValue?)
     case requestTimedOut(method: String), requestCancelled(method: String)
-    case missingField(String), unsupportedFeature(String), invalidConfiguration(String), unsafePath(String)
+    case missingField(String), invalidField(String), unsupportedFeature(String), invalidConfiguration(String), unsafePath(String)
     case invalidArgument(String)
+    case operationUnavailableDuringRecovery(String)
     /// The server returned success, but its mutation result could not be decoded.
     /// The operation may have taken effect. Reconcile server state before retrying.
     case invalidMutationResponse(method: String, reason: String, response: JSONValue)
@@ -29,7 +30,9 @@ extension CodexError: LocalizedError {
         case .staleResponseHandle: "This response handle belongs to an earlier connection."
         case .responseAlreadySent: "This interaction has already been answered."
         case .missingField(let field): "The response is missing \(field)."
+        case .invalidField(let field): "The response field \(field) has an invalid type or value."
         case .invalidArgument(let reason): "Invalid argument: \(reason)"
+        case .operationUnavailableDuringRecovery(let operation): "The \(operation) operation is unavailable until lost interactions are reconciled."
         case .invalidMutationResponse(let method, let reason, _):
             "The server acknowledged \(method), but its response was invalid: \(reason) The operation may have taken effect; reconcile server state before retrying."
         case .unsupportedFeature(let feature): "The connected Codex does not support \(feature)."
@@ -51,9 +54,23 @@ public enum CodexConnectionState: Sendable, Equatable {
 }
 
 public struct CodexRecoveryContext: Sendable, Equatable {
-    public var threadIDs: Set<String>
+    public var lostInteractions: [CodexLostInteraction]
+    public var threadIDs: Set<String> { Set(lostInteractions.compactMap(\.threadID)) }
+    public var unscopedRequestIDs: [JSONValue] { lostInteractions.filter { $0.threadID == nil }.map(\.requestID) }
     public var reason: String
-    public init(threadIDs: Set<String>, reason: String) { self.threadIDs = threadIDs; self.reason = reason }
+    public init(lostInteractions: [CodexLostInteraction], reason: String) {
+        self.lostInteractions = lostInteractions; self.reason = reason
+    }
+}
+
+public struct CodexLostInteraction: Sendable, Equatable, Hashable, Identifiable {
+    public var requestID: JSONValue
+    public var method: String
+    public var threadID: String?
+    public var id: JSONValue { requestID }
+    public init(requestID: JSONValue, method: String, threadID: String?) {
+        self.requestID = requestID; self.method = method; self.threadID = threadID
+    }
 }
 
 public struct CodexClientInfo: Codable, Sendable, Equatable {

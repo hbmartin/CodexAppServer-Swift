@@ -32,10 +32,30 @@ public struct CodexTurn: CodexRawModel, Identifiable {
     /// Validated at initialization, so it is never empty.
     public let id: String
     public var status: String? { raw["status"]?.stringValue }
+    public var statusValue: CodexTurnStatus { .init(raw["status"] ?? .null) }
     /// - Throws: `CodexError.invalidArgument` for an empty `threadID`, or `CodexError.missingField` for an unusable `id`.
     public init(threadID: String, raw: JSONValue) throws {
         guard !threadID.isEmpty else { throw CodexError.invalidArgument("threadID must not be empty") }
         self.threadID = threadID; self.id = try raw.requireString("id", context: "turn"); self.raw = raw
+    }
+}
+
+public enum CodexTurnStatus: Sendable, Equatable {
+    case inProgress, completed, interrupted, failed, unknown(JSONValue)
+    public init(_ raw: JSONValue) {
+        switch raw.stringValue {
+        case "inProgress": self = .inProgress
+        case "completed": self = .completed
+        case "interrupted": self = .interrupted
+        case "failed": self = .failed
+        default: self = .unknown(raw)
+        }
+    }
+    public var isTerminal: Bool {
+        switch self {
+        case .completed, .interrupted, .failed: true
+        default: false
+        }
     }
 }
 
@@ -83,11 +103,16 @@ public struct CodexItem: CodexRawModel, Identifiable {
 public struct CodexPage<Element: Sendable & Equatable>: Sendable, Equatable {
     public var items: [Element]
     public var nextCursor: String?
+    public var backwardsCursor: String?
     public var raw: JSONValue
-    public init(items: [Element], nextCursor: String?, raw: JSONValue) { self.items = items; self.nextCursor = nextCursor; self.raw = raw }
+    public init(items: [Element], nextCursor: String?, backwardsCursor: String? = nil, raw: JSONValue) {
+        self.items = items; self.nextCursor = nextCursor; self.backwardsCursor = backwardsCursor; self.raw = raw
+    }
 }
 
 public enum CodexHistoryItemView: String, Sendable { case omitted = "notLoaded", summarized = "summary", full }
+public enum CodexSortDirection: String, Sendable, Equatable { case ascending = "asc", descending = "desc" }
+public enum CodexThreadSortKey: String, Sendable, Equatable { case createdAt = "created_at", updatedAt = "updated_at", recencyAt = "recency_at" }
 public enum CodexForkMode: String, Sendable { case fullHistory = "full", lastTurn = "lastTurn" }
 public enum CodexApprovalPolicy: String, Sendable { case untrusted, onFailure = "on-failure", onRequest = "on-request", never }
 public enum CodexSandboxMode: String, Sendable { case readOnly = "read-only", workspaceWrite = "workspace-write", dangerFullAccess = "danger-full-access" }
@@ -101,9 +126,9 @@ public struct CodexThreadQuery: Sendable {
     public var pinned: Bool?
     public var modelProviders: [String]
     public var parentThreadID: String?, ancestorThreadID: String?
-    public var sortKey: String?, sortDirection: String?
+    public var sortKey: CodexThreadSortKey?, sortDirection: CodexSortDirection?
     public var useStateDatabaseOnly: Bool
-    public init(cursor: String? = nil, limit: Int? = nil, archived: Bool? = nil, sourceKinds: [String] = [], search: String? = nil, workingDirectories: [String] = [], pinned: Bool? = nil, modelProviders: [String] = [], parentThreadID: String? = nil, ancestorThreadID: String? = nil, sortKey: String? = nil, sortDirection: String? = nil, useStateDatabaseOnly: Bool = false) {
+    public init(cursor: String? = nil, limit: Int? = nil, archived: Bool? = nil, sourceKinds: [String] = [], search: String? = nil, workingDirectories: [String] = [], pinned: Bool? = nil, modelProviders: [String] = [], parentThreadID: String? = nil, ancestorThreadID: String? = nil, sortKey: CodexThreadSortKey? = nil, sortDirection: CodexSortDirection? = nil, useStateDatabaseOnly: Bool = false) {
         self.cursor = cursor; self.limit = limit; self.archived = archived; self.sourceKinds = sourceKinds; self.search = search; self.workingDirectories = workingDirectories; self.pinned = pinned; self.modelProviders = modelProviders; self.parentThreadID = parentThreadID; self.ancestorThreadID = ancestorThreadID; self.sortKey = sortKey; self.sortDirection = sortDirection; self.useStateDatabaseOnly = useStateDatabaseOnly
     }
     var json: JSONValue {
@@ -114,7 +139,7 @@ public struct CodexThreadQuery: Sendable {
         if !workingDirectories.isEmpty { value["cwd"] = .array(workingDirectories.map(JSONValue.string)) }
         if let pinned { value["isPinned"] = .bool(pinned) }; if !modelProviders.isEmpty { value["modelProviders"] = .array(modelProviders.map(JSONValue.string)) }
         if let parentThreadID { value["parentThreadId"] = .string(parentThreadID) }; if let ancestorThreadID { value["ancestorThreadId"] = .string(ancestorThreadID) }
-        if let sortKey { value["sortKey"] = .string(sortKey) }; if let sortDirection { value["sortDirection"] = .string(sortDirection) }
+        if let sortKey { value["sortKey"] = .string(sortKey.rawValue) }; if let sortDirection { value["sortDirection"] = .string(sortDirection.rawValue) }
         if useStateDatabaseOnly { value["useStateDbOnly"] = true }
         return .object(value)
     }

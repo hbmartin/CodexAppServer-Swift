@@ -4,9 +4,9 @@ public struct CodexRawClient: Sendable {
     private let client: CodexClient
     init(client: CodexClient) { self.client = client }
     public func request(method: String, params: JSONValue = .object([:]), timeout: Duration? = nil) async throws -> JSONValue {
-        try await client.rawRequest(method: method, params: params, timeout: timeout)
+        try await client.rawUserRequest(method: method, params: params, timeout: timeout)
     }
-    public func notify(method: String, params: JSONValue? = nil) async throws { try await client.rawNotify(method: method, params: params) }
+    public func notify(method: String, params: JSONValue? = nil) async throws { try await client.rawUserNotify(method: method, params: params) }
 }
 
 enum RoutedNotificationMethod: String, CaseIterable, Sendable {
@@ -44,6 +44,7 @@ public actor CodexClient {
     }
     private struct Subscriber {
         let threadID: String?
+        let includesProtocolMessages: Bool
         let buffer: CodexEventBuffer
     }
 
@@ -66,9 +67,10 @@ public actor CodexClient {
     private var state: CodexConnectionState = .disconnected
     private var intentionallyClosing = false
     var threadStates: [String: CodexThreadState] = [:]
-    var subscriptionIntents: Set<String> = []
-    private var pendingInteractionIDs: Set<JSONValue> = []
-    private var lostInteractionThreadIDs: Set<String> = []
+    var explicitSubscriptionIntents: Set<String> = []
+    private var streamSubscriptionIntentCounts: [String: Int] = [:]
+    private var pendingInteractions: [JSONValue: CodexLostInteraction] = [:]
+    private var lostInteractions: [JSONValue: CodexLostInteraction] = [:]
     private var interactionHandler: CodexInteractionHandler?
     private var initializationResult: JSONValue?
 
@@ -83,6 +85,18 @@ public actor CodexClient {
     public func state(for threadID: String) -> CodexThreadState? { threadStates[threadID] }
     public func allThreadStates() -> [String: CodexThreadState] { threadStates }
     public func setInteractionHandler(_ handler: CodexInteractionHandler?) { interactionHandler = handler }
+    public func acknowledgeLostInteractions(ids: [JSONValue]) throws {
+        let missing = ids.filter { lostInteractions[$0] == nil }
+        guard missing.isEmpty else { throw CodexError.invalidArgument("One or more request IDs are not awaiting recovery") }
+        for id in ids { lostInteractions[id] = nil }
+        updateRecoveryStateIfResolved()
+    }
+
+    var restorationThreadIDs: Set<String> {
+        explicitSubscriptionIntents
+            .union(streamSubscriptionIntentCounts.keys)
+            .union(lostInteractions.values.compactMap(\.threadID))
+    }
 
     @discardableResult
     public func connect() async throws -> JSONValue {
@@ -117,7 +131,7 @@ public actor CodexClient {
         intentionallyClosing = false
         setState(.connecting)
         failAllPending(with: CodexError.transportClosed("manual reconnect"))
-        if !pendingInteractionIDs.isEmpty { lostInteractionThreadIDs.formUnion(subscriptionIntents) }
+        preserveLostInteractions()
         invalidateInteractions()
         do {
             await tearDownTransport()
@@ -148,50 +162,81 @@ public actor CodexClient {
         if lifecycleID == operation { setState(.disconnected) }
     }
 
-    public func subscribe(policy: CodexBufferingPolicy = .default) -> CodexSubscription { makeSubscription(threadID: nil, policy: policy) }
-    public func events(for threadID: String, policy: CodexBufferingPolicy = .default) throws -> CodexSubscription {
+    public func subscribe(policy: CodexBufferingPolicy = .default, includesProtocolMessages: Bool = false) -> CodexSubscription {
+        makeSubscription(threadID: nil, policy: policy, includesProtocolMessages: includesProtocolMessages)
+    }
+    public func events(for threadID: String, policy: CodexBufferingPolicy = .default, includesProtocolMessages: Bool = false) throws -> CodexSubscription {
         if threadID.isEmpty { throw CodexError.invalidArgument("threadID must not be empty") }
-        return makeSubscription(threadID: threadID, policy: policy)
+        return makeSubscription(threadID: threadID, policy: policy, includesProtocolMessages: includesProtocolMessages)
     }
 
-    private func makeSubscription(threadID: String?, policy: CodexBufferingPolicy) -> CodexSubscription {
+    private func makeSubscription(threadID: String?, policy: CodexBufferingPolicy, includesProtocolMessages: Bool) -> CodexSubscription {
         let id = UUID()
         let buffer = CodexEventBuffer(policy: policy, maximumCoalescedBytes: configuration.maximumFrameBytes) { [weak self] in
             Task { await self?.removeSubscriber(id) }
         }
         let lifetime = CodexEventStreamLifetime(buffer: buffer)
         let stream = AsyncThrowingStream<CodexEvent, Error>(unfolding: { try await lifetime.buffer.next() })
-        subscribers[id] = Subscriber(threadID: threadID, buffer: buffer)
+        subscribers[id] = Subscriber(threadID: threadID, includesProtocolMessages: includesProtocolMessages, buffer: buffer)
         if let threadID {
-            subscriptionIntents.insert(threadID)
-            if subscriptionIntents.count == 9 { emit(.diagnostic(.highThreadSubscriptionCount(subscriptionIntents.count))) }
+            streamSubscriptionIntentCounts[threadID, default: 0] += 1
+            let count = restorationThreadIDs.count
+            if count == 9 { emit(.diagnostic(.highThreadSubscriptionCount(count))) }
         }
         return CodexSubscription(id: id, events: stream) { buffer.finish() }
     }
 
     private func removeSubscriber(_ id: UUID) {
         guard let removed = subscribers.removeValue(forKey: id) else { return }
-        if let threadID = removed.threadID, !subscribers.values.contains(where: { $0.threadID == threadID }) { subscriptionIntents.remove(threadID) }
+        if let threadID = removed.threadID, let count = streamSubscriptionIntentCounts[threadID] {
+            if count <= 1 { streamSubscriptionIntentCounts[threadID] = nil }
+            else { streamSubscriptionIntentCounts[threadID] = count - 1 }
+        }
         removed.buffer.finish()
     }
 
-    public func rawRequest(method: String, params: JSONValue = .object([:]), timeout: Duration? = nil) async throws -> JSONValue {
-        try requireConnected()
+    func rawRequest(method: String, params: JSONValue = .object([:]), timeout: Duration? = nil) async throws -> JSONValue {
+        try requireConnected(allowDuringRecovery: typedOperationAllowedDuringRecovery(method: method, params: params), operation: method)
         return try await performRequest(method: method, params: params, timeout: timeout ?? configuration.requestTimeout)
     }
 
-    public func rawNotify(method: String, params: JSONValue? = nil) async throws {
-        try requireConnected()
+    func rawNotify(method: String, params: JSONValue? = nil) async throws {
+        try requireConnected(allowDuringRecovery: false, operation: method)
         try await sendEnvelope(notification: method, params: params)
     }
 
-    private func requireConnected() throws {
+    func rawUserRequest(method: String, params: JSONValue, timeout: Duration?) async throws -> JSONValue {
+        try requireConnected(allowDuringRecovery: false, operation: method)
+        return try await performRequest(method: method, params: params, timeout: timeout ?? configuration.requestTimeout)
+    }
+
+    func rawUserNotify(method: String, params: JSONValue?) async throws {
+        try requireConnected(allowDuringRecovery: false, operation: method)
+        try await sendEnvelope(notification: method, params: params)
+    }
+
+    private func requireConnected(allowDuringRecovery: Bool, operation: String) throws {
         switch state {
-        case .connected, .recoveryRequired: return
+        case .connected: return
+        case .recoveryRequired where allowDuringRecovery: return
+        case .recoveryRequired: throw CodexError.operationUnavailableDuringRecovery(operation)
         case .reconnecting: throw CodexError.reconnecting
         case .closing: throw CodexError.closing
         default: throw CodexError.disconnected
         }
+    }
+
+    private func typedOperationAllowedDuringRecovery(method: String, params: JSONValue) -> Bool {
+        let reads: Set<String> = [
+            "thread/list", "thread/read", "thread/loaded/list", "thread/turns/list", "thread/items/list",
+            "thread/resume", "thread/unsubscribe", "model/list", "skills/list", "collaborationMode/list",
+            "permissionProfile/list", "thread/backgroundTerminals/list", "fs/getMetadata", "fs/readDirectory", "fs/readFile",
+        ]
+        if reads.contains(method) { return true }
+        if method == "turn/interrupt", let threadID = params["threadId"]?.stringValue {
+            return lostInteractions.values.contains { $0.threadID == threadID }
+        }
+        return false
     }
 
     private func checkOperation(_ operation: UUID) throws {
@@ -334,6 +379,7 @@ public actor CodexClient {
         }
         guard let method = message["method"]?.stringValue else { emit(.diagnostic(.malformedMessage("message has no method or response id"))); return }
         let params = message["params"] ?? .object([:])
+        emit(.protocolMessage(message))
         if let requestID = message["id"] { await routeServerRequest(id: requestID, method: method, params: params) }
         else { routeNotification(method: method, params: params) }
     }
@@ -369,7 +415,11 @@ public actor CodexClient {
         }
         switch routedMethod {
         case .serverRequestResolved:
-            if let id = params["requestId"] { pendingInteractionIDs.remove(id) }
+            if let id = params["requestId"] {
+                pendingInteractions[id] = nil
+                lostInteractions[id] = nil
+                updateRecoveryStateIfResolved()
+            }
             emit(.serverRequestResolved(params))
         case .commandExecOutputDelta:
             guard let output = decodeOrReport(method, { try CodexCommandOutput(raw: params) }) else { return }
@@ -414,6 +464,9 @@ public actor CodexClient {
             else { emit(.turnStarted(threadID: threadID, turn: turn)) }
         case .agentMessageDelta, .planDelta, .reasoningTextDelta, .reasoningSummaryTextDelta,
              .commandExecutionOutputDelta, .fileChangeOutputDelta:
+            if let encoded = params["deltaBase64"]?.stringValue, Data(base64Encoded: encoded) == nil {
+                emit(malformed(method.rawValue, "invalid params.deltaBase64", threadID: threadID)); return
+            }
             emit(.itemDelta(
                 threadID: threadID,
                 itemID: params["itemId"]?.stringValue,
@@ -426,8 +479,10 @@ public actor CodexClient {
     }
 
     private func routeServerRequest(id: JSONValue, method: String, params: JSONValue) async {
-        if let threadID = params["threadId"]?.stringValue { lostInteractionThreadIDs.remove(threadID) }
-        pendingInteractionIDs.insert(id)
+        let record = CodexLostInteraction(requestID: id, method: method, threadID: params["threadId"]?.stringValue)
+        lostInteractions[id] = nil
+        pendingInteractions[id] = record
+        updateRecoveryStateIfResolved()
         if method == "item/tool/call" { runDynamicTool(id: id, params: params); return }
         let interaction = makeInteraction(id: id, method: method, params: params)
         emit(.serverRequest(interaction))
@@ -477,10 +532,10 @@ public actor CodexClient {
 
     public func respondToServerRequest(id: JSONValue, response: CodexInteractionResponse, generation expectedGeneration: UInt64) async throws {
         guard expectedGeneration == generation else { throw CodexError.staleResponseHandle }
-        guard pendingInteractionIDs.contains(id) else { throw CodexError.staleResponseHandle }
+        guard pendingInteractions[id] != nil else { throw CodexError.staleResponseHandle }
         guard transportInitialized, transport != nil, !intentionallyClosing else { throw CodexError.disconnected }
         // A send error is ambiguous: reserve permanently rather than risk replying twice.
-        pendingInteractionIDs.remove(id)
+        pendingInteractions[id] = nil
         switch response {
         case .error(let code, let message, let data):
             var error: [String: JSONValue] = ["code": .number(Decimal(code)), "message": .string(message)]
@@ -500,8 +555,14 @@ public actor CodexClient {
     func reduceTurn(_ turn: CodexTurn, completed: Bool) {
         var state = threadStates[turn.threadID] ?? .init()
         if state.turns[turn.id] == nil { state.turnOrder.append(turn.id) }
+        if !completed, let existing = state.turns[turn.id], existing.statusValue.isTerminal {
+            state.activeTurnIDs.remove(turn.id)
+            threadStates[turn.threadID] = state
+            return
+        }
         state.turns[turn.id] = turn
-        if completed { state.activeTurnIDs.remove(turn.id) } else { state.activeTurnIDs.insert(turn.id) }
+        if completed || turn.statusValue.isTerminal { state.activeTurnIDs.remove(turn.id) }
+        else { state.activeTurnIDs.insert(turn.id) }
         threadStates[turn.threadID] = state
     }
 
@@ -518,7 +579,7 @@ public actor CodexClient {
                 guard let turn = try? CodexTurn(threadID: thread.id, raw: rawTurn) else { skipped += 1; continue }
                 if snapshot.turns[turn.id] == nil { snapshot.turnOrder.append(turn.id) }
                 snapshot.turns[turn.id] = turn
-                if turn.status == "inProgress" { snapshot.activeTurnIDs.insert(turn.id) }
+                if turn.statusValue == .inProgress { snapshot.activeTurnIDs.insert(turn.id) }
                 for rawItem in rawTurn["items"]?.arrayValue ?? [] {
                     guard let item = try? CodexItem(raw: rawItem, turnID: turn.id) else { skipped += 1; continue }
                     if snapshot.items[item.id] == nil { snapshot.itemOrder.append(item.id) }
@@ -533,19 +594,41 @@ public actor CodexClient {
     }
 
     func emit(_ event: CodexEvent) {
-        for (id, subscriber) in subscribers where subscriber.threadID == nil || subscriber.threadID == event.threadID {
+        for (id, subscriber) in subscribers
+        where (subscriber.threadID == nil || subscriber.threadID == event.threadID)
+            && (subscriber.includesProtocolMessages || !event.isProtocolMessage) {
             if !subscriber.buffer.yield(event) { removeSubscriber(id) }
         }
     }
     private func setState(_ newState: CodexConnectionState) { state = newState; emit(.connection(newState)) }
-    private func invalidateInteractions() { pendingInteractionIDs.removeAll(); for task in dynamicToolTasks.values { task.cancel() }; dynamicToolTasks.removeAll() }
+    private func invalidateInteractions() { pendingInteractions.removeAll(); for task in dynamicToolTasks.values { task.cancel() }; dynamicToolTasks.removeAll() }
+
+    private func preserveLostInteractions() {
+        for (id, record) in pendingInteractions { lostInteractions[id] = record }
+    }
+
+    private func recoveryContext() -> CodexRecoveryContext? {
+        guard !lostInteractions.isEmpty else { return nil }
+        let records = lostInteractions.values.sorted { lhs, rhs in
+            let left = lhs.requestID.stringValue ?? String(lhs.requestID.int64Value ?? 0)
+            let right = rhs.requestID.stringValue ?? String(rhs.requestID.int64Value ?? 0)
+            return left < right
+        }
+        return .init(lostInteractions: records, reason: "The server did not replay or resolve one or more interactions after reconnecting.")
+    }
+
+    private func updateRecoveryStateIfResolved() {
+        guard case .recoveryRequired = state else { return }
+        if let context = recoveryContext() { setState(.recoveryRequired(context)) }
+        else { setState(.connected(generation: generation)) }
+    }
 
     private func transportEnded(id: UUID, error: Error) async {
         guard activeTransportID == id, !intentionallyClosing else { return }
         let wasReady: Bool
         switch state { case .connected, .recoveryRequired: wasReady = true; default: wasReady = false }
         let operation = lifecycleID
-        if !pendingInteractionIDs.isEmpty { lostInteractionThreadIDs.formUnion(subscriptionIntents) }
+        preserveLostInteractions()
         failAllPending(with: error); invalidateInteractions()
         if wasReady { setState(.reconnecting(attempt: 1, maximumAttempts: configuration.reconnectPolicy.maximumAttempts)) }
         await tearDownTransport()
@@ -585,20 +668,20 @@ public actor CodexClient {
         reconnectTask = nil; setState(.failed("Automatic reconnect attempts exhausted; call reconnect()."))
     }
     private func restoreSubscriptionIntents(operation: UUID) async throws -> CodexRecoveryContext? {
-        var recoveryThreadIDs: Set<String> = []
-        for threadID in subscriptionIntents {
+        for threadID in restorationThreadIDs.sorted() {
             try checkOperation(operation)
             _ = try await performRequest(method: "thread/resume", params: ["threadId": .string(threadID), "excludeTurns": true], timeout: configuration.requestTimeout)
             try checkOperation(operation)
             let result = try await performRequest(method: "thread/read", params: ["threadId": .string(threadID), "includeTurns": true], timeout: configuration.requestTimeout)
             try checkOperation(operation)
             let flags = result["thread"]?["status"]?["activeFlags"]?.arrayValue?.compactMap(\.stringValue) ?? []
-            if lostInteractionThreadIDs.contains(threadID), (flags.contains("waitingOnApproval") || flags.contains("waitingOnUserInput")) { recoveryThreadIDs.insert(threadID) }
-            else { lostInteractionThreadIDs.remove(threadID) }
+            let waiting = flags.contains("waitingOnApproval") || flags.contains("waitingOnUserInput")
+            if !waiting {
+                let resolved = lostInteractions.compactMap { $0.value.threadID == threadID ? $0.key : nil }
+                for id in resolved { lostInteractions[id] = nil }
+            }
         }
-        guard !recoveryThreadIDs.isEmpty else { return nil }
-        let context = CodexRecoveryContext(threadIDs: recoveryThreadIDs, reason: "The resumed task is waiting for an interaction that the server did not replay.")
-        lostInteractionThreadIDs.subtract(recoveryThreadIDs); return context
+        return recoveryContext()
     }
     private func tearDownTransport() async {
         activeTransportID = nil

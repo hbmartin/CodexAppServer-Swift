@@ -1,4 +1,5 @@
 import Foundation
+import DequeModule
 
 /// Synchronous producers and an asynchronous consumer share one bounded queue.
 /// Every mutable field is protected by `lock`; callbacks never run under that lock.
@@ -7,7 +8,7 @@ final class CodexEventBuffer: @unchecked Sendable {
     private let policy: CodexBufferingPolicy
     private let maximumCoalescedBytes: Int
     private let onTermination: @Sendable () -> Void
-    private var queue: [CodexEvent] = []
+    private var queue: Deque<CodexEvent> = []
     private var waiter: CheckedContinuation<CodexEvent?, Error>?
     private var ended = false
     private var failure: Error?
@@ -52,7 +53,7 @@ final class CodexEventBuffer: @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 lock.withLock {
-                    if !queue.isEmpty { continuation.resume(returning: queue.removeFirst()) }
+                    if let first = queue.popFirst() { continuation.resume(returning: first) }
                     else if ended {
                         if let failure { continuation.resume(throwing: failure) }
                         else { continuation.resume(returning: nil) }

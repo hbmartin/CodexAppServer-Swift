@@ -66,11 +66,18 @@ public final class CodexConversationDetailModel {
         task = Task { @MainActor [weak self] in
             defer { subscription.cancel() }
             do {
-                for try await _ in subscription.events {
+                for try await event in subscription.events {
                     guard let self, observationGeneration == generation, !Task.isCancelled else { return }
-                    let snapshot = await client.state(for: threadID)
-                    guard observationGeneration == generation, !Task.isCancelled else { return }
-                    if let snapshot { apply(snapshot) }
+                    switch event {
+                    case .threadStateUpdated(let id, let snapshot) where id == threadID:
+                        apply(snapshot)
+                    case .itemStarted, .itemCompleted, .turnStarted, .turnCompleted:
+                        let snapshot = await client.state(for: threadID)
+                        guard observationGeneration == generation, !Task.isCancelled else { return }
+                        if let snapshot { apply(snapshot) }
+                    default:
+                        break
+                    }
                 }
             } catch {}
         }
