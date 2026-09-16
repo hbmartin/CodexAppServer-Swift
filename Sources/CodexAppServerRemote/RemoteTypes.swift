@@ -204,15 +204,15 @@ public enum CodexRemoteDiagnosticMode: Sendable, Equatable {
 }
 
 public struct CodexRemoteConfiguration: Sendable, Equatable {
-    public var baseURL: URL
-    public var requestTimeout: TimeInterval
-    public var pingInterval: Duration
-    public var maximumFrameBytes: Int
-    public var maximumSegmentBytes: Int
-    public var maximumOutboundFrames: Int
-    public var maximumReadAttempts: Int
-    public var maximumHostPages: Int
-    public var diagnosticMode: CodexRemoteDiagnosticMode
+    public let baseURL: URL
+    public let requestTimeout: TimeInterval
+    public let pingInterval: Duration
+    public let maximumFrameBytes: Int
+    public let maximumSegmentBytes: Int
+    public let maximumOutboundFrames: Int
+    public let maximumReadAttempts: Int
+    public let maximumHostPages: Int
+    public let diagnosticMode: CodexRemoteDiagnosticMode
 
     public static let official = try! Self()
 

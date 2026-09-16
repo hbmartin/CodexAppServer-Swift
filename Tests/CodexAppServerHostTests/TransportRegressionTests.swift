@@ -90,6 +90,37 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     await transport.close()
 }
 
+@Test func processTransportCloseWakesReadersWhenADescendantKeepsPipesOpen() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = directory.appendingPathComponent("inherited-pipes.py")
+    let childPIDFile = directory.appendingPathComponent("child-pid")
+    let source = """
+    #!/usr/bin/python3
+    import os, signal, time
+    child = os.fork()
+    if child == 0:
+        open(\"\(childPIDFile.path)\", \"w\").write(str(os.getpid()))
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True: time.sleep(1)
+    while True: time.sleep(1)
+    """
+    try source.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
+    try await transport.start()
+    for _ in 0..<500 where !FileManager.default.fileExists(atPath: childPIDFile.path) {
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    let childPID = try Int32(String(contentsOf: childPIDFile, encoding: .utf8))!
+    defer { _ = Darwin.kill(childPID, SIGKILL) }
+    let clock = ContinuousClock()
+    let started = clock.now
+    await transport.close()
+    #expect(clock.now - started < .seconds(2))
+}
+
 @Test(.enabled(if: ProcessInfo.processInfo.environment["RUN_CODEX_PROCESS_TESTS"] == "1"))
 func reviewSSHForwardWaitsForListenerReadiness() async throws {
     let executable = try CodexCLIResolver().resolve()

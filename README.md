@@ -137,7 +137,10 @@ System SSH always uses `BatchMode=yes` and normal known-host enforcement. Pass a
 ```swift
 import CodexAppServerRemote
 
-let credentials = try CodexRemoteCodexLoginCredentialProvider()
+let credentials = CodexRemoteEnvironmentCredentialProvider(
+    tokenVariable: "CODEX_ACCOUNT_TOKEN",
+    accountIDVariable: "CODEX_ACCOUNT_ID"
+)
 let authorization = MyDeviceBoundRemoteAuthorizationProvider()
 let controller = CodexRemoteController(
     credentials: credentials,
@@ -151,7 +154,7 @@ let tasks = try await session.client.listThreads(.init(limit: 20))
 await session.close()
 ```
 
-An account login is sufficient for environment discovery. Pairing and connections additionally require an enrolled controller session and device-key signer supplied through `CodexRemoteClientAuthorizationProvider`; the provider owns step-up enrollment, protected-key persistence, token refresh, and proof generation. The SDK does not reuse another application's enrollment. The supported API deliberately contains no public `WHAM` names even though the manual-pair operation currently uses that hidden service route. Safe reads use bounded retries; mutations are never retried because delivery may be ambiguous. Secrets have redacted descriptions and reflection, and `CodexRemoteCodexLoginCredentialProvider` rereads the selected login file for each credential request.
+An account login is sufficient for environment discovery. Pairing and connections additionally require an enrolled controller session and device-key signer supplied through `CodexRemoteClientAuthorizationProvider`; the provider owns step-up enrollment, protected-key persistence, token refresh, and proof generation. The SDK does not reuse another application's enrollment. The supported API deliberately contains no public `WHAM` names even though the manual-pair operation currently uses that hidden service route. Safe reads use bounded retries; mutations are never retried because delivery may be ambiguous. Secrets have redacted descriptions and reflection. On macOS, `CodexRemoteCodexLoginCredentialProvider` is a convenience that rereads the selected login file for each credential request.
 
 ## Reference CLI
 

@@ -64,6 +64,7 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     let configuration = try CodexRemoteConfiguration(
         baseURL: URL(string: "http://127.0.0.1:\(port)/backend-api")!,
         pingInterval: .seconds(60),
+        maximumFrameBytes: 2_100,
         maximumSegmentBytes: 512,
         maximumOutboundFrames: 1
     )
@@ -84,7 +85,7 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     let segmentedData = try #require(try await firstFrames.next())
     let segmented = try JSONValue.decode(segmentedData)
     #expect(segmented["server"] == 2)
-    #expect(segmented["blob"]?.stringValue?.count == 2_000)
+    #expect(try segmented.encoded().count == 2_100)
     var firstDiagnostics = first.diagnostics.makeAsyncIterator()
     #expect(await firstDiagnostics.next()?.message.contains("duplicate") == true)
     await first.close()
@@ -97,7 +98,15 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     #expect(try JSONValue.decode(secondData)["server"] == 3)
     var secondDiagnostics = second.diagnostics.makeAsyncIterator()
     #expect(await secondDiagnostics.next()?.message.contains("duplicate") == true)
-    await second.close()
+    let finalSend = Task {
+        try await second.send(frame: try JSONValue.object(["client": 4, "blob": .string(String(repeating: "z", count: 2_000))]).encoded())
+    }
+    try await Task.sleep(for: .milliseconds(10))
+    let concurrentClose = Task { await second.close() }
+    let secondClose = Task { await second.close() }
+    try await finalSend.value
+    await concurrentClose.value
+    await secondClose.value
 
     for _ in 0..<500 where !FileManager.default.fileExists(atPath: report.path) {
         try await Task.sleep(for: .milliseconds(10))
@@ -108,7 +117,16 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     #expect(raw["outbound_payloads"]?[1]?["client"] == 2)
     #expect(raw["outbound_payloads"]?[1]?["blob"]?.stringValue?.count == 2_000)
     #expect(raw["outbound_payloads"]?[2] == ["client": 3])
-    #expect(raw["chunk_counts"] == [1, 4, 1])
+    let chunkCountValues = try #require(raw["chunk_counts"]?.arrayValue)
+    let chunkCounts = chunkCountValues.compactMap(\.intValue)
+    #expect(chunkCounts.count == 3)
+    #expect(chunkCounts[0] == 1)
+    #expect(chunkCounts[1] > 1)
+    #expect(chunkCounts[2] == 1)
+    let wireFrameSizeValues = try #require(raw["wire_frame_sizes"]?.arrayValue)
+    let wireFrameSizes = wireFrameSizeValues.compactMap(\.intValue)
+    #expect(!wireFrameSizes.isEmpty)
+    #expect(wireFrameSizes.allSatisfy { $0 <= 512 })
     #expect(raw["authorization"] == ["Bearer account-token", "Bearer account-token"])
     #expect(raw["account_ids"] == ["account", "account"])
     #expect(raw["session_tokens"] == ["Bearer session-token", "Bearer session-token"])
@@ -119,6 +137,13 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     let streamIDs = streamValues.compactMap(\.stringValue)
     #expect(streamIDs.count == 2)
     #expect(streamIDs[0] != streamIDs[1])
+    let wireFrames = try #require(raw["wire_frames"]?.arrayValue)
+    for streamID in streamIDs {
+        let streamFrames = wireFrames.filter { $0["stream_id"]?.stringValue == streamID }
+        #expect(streamFrames.last?["type"] == "client_closed")
+        let closeSequence = try #require(streamFrames.last?["seq_id"]?.intValue)
+        #expect(streamFrames.dropLast().allSatisfy { ($0["seq_id"]?.intValue ?? closeSequence) < closeSequence })
+    }
 }
 
 @Test func remoteLoopbackWebSocketValidatesAndAnswersDeviceKeyChallengeBeforeAppTraffic() async throws {
@@ -163,6 +188,57 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     #expect(raw["message"] == ["client": "after-proof"])
 }
 
+@Test func remoteErrorsCorrelateByIDAndUnmatchedErrorsDoNotConsumePendingRequests() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let port = try availableLoopbackPort()
+    let script = directory.appendingPathComponent("remote-errors-ws.py")
+    try remoteErrorServerSource.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    let process = Process()
+    process.executableURL = script
+    process.arguments = [String(port)]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    defer { if process.isRunning { process.terminate() } }
+    try await waitForLoopbackListener(port: port)
+
+    let configuration = try CodexRemoteConfiguration(
+        baseURL: URL(string: "http://127.0.0.1:\(port)/backend-api")!,
+        pingInterval: .seconds(60)
+    )
+    let controller = CodexRemoteController(
+        credentials: LoopbackCredentials(),
+        authorizationProvider: LoopbackAuthorization(),
+        configuration: configuration
+    )
+    let transport = try await controller.transportFactory(environmentID: "env-1").makeTransport()
+    try await transport.start()
+    try await transport.send(frame: try JSONValue.object(["id": "first", "method": "first/request", "params": [:]]).encoded())
+    try await transport.send(frame: try JSONValue.object(["id": 2, "method": "second/request", "params": [:]]).encoded())
+
+    var frames = transport.incomingFrames.makeAsyncIterator()
+    let secondError = try JSONValue.decode(try #require(try await frames.next()))
+    #expect(secondError["id"] == 2)
+    #expect(secondError["error"]?["code"] == -32_002)
+    #expect(secondError["error"]?["data"]?["order"] == 2)
+    let firstResult = try JSONValue.decode(try #require(try await frames.next()))
+    #expect(firstResult == ["id": "first", "result": ["ok": true]])
+    let unmatched = try JSONValue.decode(try #require(try await frames.next()))
+    #expect(unmatched["id"] == 999)
+    #expect(unmatched["error"]?["code"] == -32_099)
+    let missingID = try JSONValue.decode(try #require(try await frames.next()))
+    #expect(missingID["type"] == "error")
+    #expect(missingID["id"] == nil)
+
+    var diagnostics = transport.diagnostics.makeAsyncIterator()
+    #expect(await diagnostics.next()?.message.contains("unmatched") == true)
+    #expect(await diagnostics.next()?.message.contains("without a string or numeric id") == true)
+    await transport.close()
+}
+
 private func availableLoopbackPort() throws -> Int {
     let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
     guard descriptor >= 0 else { throw CodexError.transportClosed("could not allocate test socket") }
@@ -204,11 +280,11 @@ private func waitForLoopbackListener(port: Int) async throws {
 
 private let remoteWebSocketServerSource = #"""
 #!/usr/bin/python3
-import base64, hashlib, json, socket, struct, sys
+import base64, hashlib, json, os, socket, struct, sys, tempfile
 
 port = int(sys.argv[1])
 report_path = sys.argv[2]
-report = {"outbound_sequences": [], "outbound_payloads": [], "chunk_counts": [], "authorization": [], "account_ids": [], "session_tokens": [], "client_ids": [], "protocol_versions": [], "paths": [], "stream_ids": []}
+report = {"outbound_sequences": [], "outbound_payloads": [], "chunk_counts": [], "wire_frame_sizes": [], "wire_frames": [], "authorization": [], "account_ids": [], "session_tokens": [], "client_ids": [], "protocol_versions": [], "paths": [], "stream_ids": []}
 
 def recv_exact(connection, count):
     output = b""
@@ -256,7 +332,11 @@ def handshake(connection):
 def receive_text(connection):
     while True:
         opcode, payload = receive_frame(connection)
-        if opcode == 1: return json.loads(payload)
+        if opcode == 1:
+            report["wire_frame_sizes"].append(len(payload))
+            value = json.loads(payload)
+            report["wire_frames"].append({"type": value.get("type"), "seq_id": value.get("seq_id"), "stream_id": value.get("stream_id")})
+            return value
         if opcode == 8: return None
         if opcode == 9: send_frame(connection, payload, 10)
 
@@ -276,7 +356,7 @@ def send_envelope(connection, sequence, stream_id, payload):
 
 def send_segmented(connection, sequence, stream_id, payload):
     data = json.dumps(payload, separators=(",", ":")).encode()
-    chunks = [data[index:index + 400] for index in range(0, len(data), 400)]
+    chunks = [data[index:index + 195] for index in range(0, len(data), 195)]
     for index, chunk in enumerate(chunks):
         send_frame(connection, json.dumps({"type": "server_message_chunk", "client_id": "client-1", "seq_id": sequence, "stream_id": stream_id, "env_id": "env-1", "cursor": None, "segment_id": index, "segment_count": len(chunks), "message_size_bytes": len(data), "message_chunk_base64": base64.b64encode(chunk).decode()}, separators=(",", ":")))
 
@@ -311,7 +391,11 @@ for connection_index in range(2):
     if connection_index == 0:
         send_envelope(connection, 1, stream_id, {"server": 1})
         send_envelope(connection, 1, stream_id, {"server": "duplicate"})
-        send_segmented(connection, 2, stream_id, {"server": 2, "blob": "y" * 2000})
+        maximum_payload = {"server": 2, "blob": ""}
+        empty_size = len(json.dumps(maximum_payload, separators=(",", ":")).encode())
+        maximum_payload["blob"] = "y" * (2100 - empty_size)
+        assert len(json.dumps(maximum_payload, separators=(",", ":")).encode()) == 2100
+        send_segmented(connection, 2, stream_id, maximum_payload)
     else:
         send_envelope(connection, 1, stream_id, {"server": 3})
         send_envelope(connection, 1, stream_id, {"server": "duplicate"})
@@ -324,12 +408,19 @@ for connection_index in range(2):
     connection.close()
 
 listener.close()
-with open(report_path, "w") as output: json.dump(report, output)
+descriptor, temporary_path = tempfile.mkstemp(dir=os.path.dirname(report_path) or ".", prefix=".remote-report-")
+try:
+    with os.fdopen(descriptor, "w") as output: json.dump(report, output)
+    os.replace(temporary_path, report_path)
+except Exception:
+    try: os.unlink(temporary_path)
+    except FileNotFoundError: pass
+    raise
 """#
 
 private let remoteChallengeServerSource = #"""
 #!/usr/bin/python3
-import base64, hashlib, json, socket, struct, sys
+import base64, hashlib, json, os, socket, struct, sys, tempfile
 
 port = int(sys.argv[1])
 report_path = sys.argv[2]
@@ -420,6 +511,101 @@ except Exception:
     pass
 connection.close()
 listener.close()
-with open(report_path, "w") as output: json.dump({"proof": proof, "message": envelope["message"]}, output)
+descriptor, temporary_path = tempfile.mkstemp(dir=os.path.dirname(report_path) or ".", prefix=".remote-report-")
+try:
+    with os.fdopen(descriptor, "w") as output: json.dump({"proof": proof, "message": envelope["message"]}, output)
+    os.replace(temporary_path, report_path)
+except Exception:
+    try: os.unlink(temporary_path)
+    except FileNotFoundError: pass
+    raise
+"""#
+
+private let remoteErrorServerSource = #"""
+#!/usr/bin/python3
+import base64, hashlib, json, socket, struct, sys
+
+port = int(sys.argv[1])
+
+def recv_exact(connection, count):
+    output = b""
+    while len(output) < count:
+        value = connection.recv(count - len(output))
+        if not value: raise EOFError()
+        output += value
+    return output
+
+def receive_frame(connection):
+    first, second = recv_exact(connection, 2)
+    length = second & 0x7f
+    if length == 126: length = struct.unpack("!H", recv_exact(connection, 2))[0]
+    elif length == 127: length = struct.unpack("!Q", recv_exact(connection, 8))[0]
+    mask = recv_exact(connection, 4) if second & 0x80 else None
+    payload = recv_exact(connection, length)
+    if mask: payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    return first & 0x0f, payload
+
+def receive_text(connection):
+    while True:
+        opcode, payload = receive_frame(connection)
+        if opcode == 1: return json.loads(payload)
+        if opcode == 8: return None
+        if opcode == 9: send_frame(connection, payload, 10)
+
+def send_frame(connection, payload, opcode=1):
+    payload = payload if isinstance(payload, bytes) else payload.encode()
+    header = bytes([0x80 | opcode])
+    if len(payload) < 126: header += bytes([len(payload)])
+    elif len(payload) < 65536: header += bytes([126]) + struct.pack("!H", len(payload))
+    else: header += bytes([127]) + struct.pack("!Q", len(payload))
+    connection.sendall(header + payload)
+
+def handshake(connection):
+    request = b""
+    while b"\r\n\r\n" not in request:
+        chunk = connection.recv(4096)
+        if not chunk: raise EOFError()
+        request += chunk
+    headers = {}
+    for line in request.decode().split("\r\n")[1:]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+    accept = base64.b64encode(hashlib.sha1((headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    connection.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+
+def send_message(connection, sequence, stream_id, payload):
+    envelope = {"type":"server_message", "client_id":"client-1", "seq_id":sequence, "stream_id":stream_id, "env_id":"env-1", "cursor":None, "message":payload}
+    send_frame(connection, json.dumps(envelope, separators=(",", ":")))
+
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(4)
+while True:
+    connection, _ = listener.accept()
+    try:
+        handshake(connection)
+        break
+    except Exception:
+        connection.close()
+
+first = receive_text(connection)
+second = receive_text(connection)
+assert first["message"]["id"] == "first"
+assert second["message"]["id"] == 2
+stream_id = first["stream_id"]
+send_message(connection, 1, stream_id, {"type":"error", "id":2, "error":{"code":-32002, "message":"second failed", "data":{"order":2}}})
+send_message(connection, 2, stream_id, {"id":"first", "result":{"ok":True}})
+send_message(connection, 3, stream_id, {"type":"error", "id":999, "code":-32099, "message":"unknown"})
+send_message(connection, 4, stream_id, {"type":"error", "code":-32100, "message":"missing id"})
+try:
+    while True:
+        value = receive_text(connection)
+        if value is None or value.get("type") == "client_closed": break
+except Exception:
+    pass
+connection.close()
+listener.close()
 """#
 #endif

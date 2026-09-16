@@ -1,10 +1,42 @@
 #if os(macOS)
 import ArgumentParser
+import Darwin
 import Foundation
 import Testing
 @testable import CodexAppServerCLI
 @testable import CodexAppServerKit
 import CodexAppServerRemote
+
+private actor CleanupTrackingTransport: CodexTransport {
+    nonisolated let incomingFrames: AsyncThrowingStream<Data, Error>
+    nonisolated let diagnostics: AsyncStream<CodexTransportDiagnostic>
+    private let frameContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private let diagnosticContinuation: AsyncStream<CodexTransportDiagnostic>.Continuation
+    private var closed = false
+
+    init() {
+        let frames = AsyncThrowingStream<Data, Error>.makeStream()
+        incomingFrames = frames.stream
+        frameContinuation = frames.continuation
+        let diagnostics = AsyncStream<CodexTransportDiagnostic>.makeStream()
+        self.diagnostics = diagnostics.stream
+        diagnosticContinuation = diagnostics.continuation
+    }
+
+    func start() {}
+    func send(frame: Data) throws {
+        let request = try JSONValue.decode(frame)
+        guard request["method"] == "initialize", let id = request["id"] else { return }
+        frameContinuation.yield(try JSONValue.object(["id": id, "result": ["serverInfo": ["name": "test", "version": "0.146.0"]]]).encoded())
+    }
+    func close() async {
+        try? await Task.sleep(for: .milliseconds(50))
+        closed = true
+        frameContinuation.finish()
+        diagnosticContinuation.finish()
+    }
+    func isClosed() -> Bool { closed }
+}
 
 @Test func commandTreeParsesEveryConnectionAndRemoteBranch() throws {
     #expect(try CodexAppServerCLI.parseAsRoot(["daemon", "status", "--json"]) is CodexAppServerCLI.Daemon.Status)
@@ -43,6 +75,15 @@ import CodexAppServerRemote
     }
 }
 
+@Test func interactiveClientCleanupFinishesBeforeAnErrorReturns() async throws {
+    let transport = CleanupTrackingTransport()
+    let factory = CodexTransportFactory { transport }
+    await #expect(throws: (any Error).self) {
+        try await runInteractive(factory: factory, notificationPath: "/definitely/missing/notify.json", json: false)
+    }
+    #expect(await transport.isClosed())
+}
+
 @Test func remoteAuthorizationHelperUsesStdinJSONForAuthorizationAndChallengeProof() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -75,5 +116,107 @@ else:
     #expect(authorization.expiresAt != nil)
     let proof = try await helper.response(to: ["nonce": "n"], using: authorization)
     #expect(proof == ["type": "device_key_proof", "keyId": "helper-key"])
+}
+
+@Test func remoteAuthorizationHelperDrainsLargeStderrWithoutBlocking() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try writeAuthorizationHelper(
+        #"""
+        #!/usr/bin/python3
+        import json, sys
+        json.load(sys.stdin)
+        sys.stderr.write("e" * 2000000)
+        print(json.dumps({"clientID":"client","sessionToken":"token","requiresDeviceKeyProof":False}))
+        """#,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path)
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    #expect(try await helper.authorization(for: credential, forceRefresh: false).clientID == "client")
+}
+
+@Test func remoteAuthorizationHelperRejectsOversizedStdout() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try writeAuthorizationHelper(
+        #"""
+        #!/usr/bin/python3
+        import sys, time
+        sys.stdin.read()
+        sys.stdout.write("x" * 1100000)
+        sys.stdout.flush()
+        time.sleep(10)
+        """#,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path)
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    await #expect(throws: CodexRemoteError.self) {
+        _ = try await helper.authorization(for: credential, forceRefresh: false)
+    }
+}
+
+@Test func remoteAuthorizationHelperTimesOutThenKillsAnUnresponsiveProcess() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pidFile = directory.appendingPathComponent("timeout-pid")
+    let script = try writeAuthorizationHelper(
+        """
+        #!/usr/bin/python3
+        import os, signal, sys, time
+        open(\"\(pidFile.path)\", \"w\").write(str(os.getpid()))
+        sys.stdin.read()
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True: time.sleep(1)
+        """,
+        in: directory
+    )
+    // Leave startup headroom when the full suite is concurrently spawning process transports.
+    let helper = try RemoteAuthorizationHelper(path: script.path, timeout: .seconds(2))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    await #expect(throws: CodexRemoteError.self) {
+        _ = try await helper.authorization(for: credential, forceRefresh: false)
+    }
+    let pid = try Int32(String(contentsOf: pidFile, encoding: .utf8))!
+    #expect(Darwin.kill(pid, 0) != 0)
+}
+
+@Test func remoteAuthorizationHelperCancellationCleansUpAndPropagates() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pidFile = directory.appendingPathComponent("cancel-pid")
+    let script = try writeAuthorizationHelper(
+        """
+        #!/usr/bin/python3
+        import os, signal, sys, time
+        open(\"\(pidFile.path)\", \"w\").write(str(os.getpid()))
+        sys.stdin.read()
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True: time.sleep(1)
+        """,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path)
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    let task = Task { try await helper.authorization(for: credential, forceRefresh: false) }
+    for _ in 0..<500 where !FileManager.default.fileExists(atPath: pidFile.path) {
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    let pid = try Int32(String(contentsOf: pidFile, encoding: .utf8))!
+    task.cancel()
+    await #expect(throws: CancellationError.self) { try await task.value }
+    #expect(Darwin.kill(pid, 0) != 0)
+}
+
+private func writeAuthorizationHelper(_ source: String, in directory: URL) throws -> URL {
+    let script = directory.appendingPathComponent("authorization-helper.py")
+    try source.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    return script
 }
 #endif

@@ -50,6 +50,42 @@ func remoteHostIdentityUsesCurrentFieldFirst(raw: JSONValue, expected: String) t
     #expect(value.withUnsafeValue { $0 } == "remote-test-secret")
 }
 
+@Test func remoteCredentialProvidersSnapshotOnlySelectedEnvironmentValuesAndRedactReflection() async throws {
+    let environment = [
+        "SELECTED_TOKEN": "selected-secret",
+        "SELECTED_ACCOUNT": "account-1",
+        "UNRELATED_SECRET": "must-not-be-retained",
+        "CODEX_HOME": "/tmp/codex-home",
+    ]
+    let provider = CodexRemoteEnvironmentCredentialProvider(
+        tokenVariable: "SELECTED_TOKEN",
+        accountIDVariable: "SELECTED_ACCOUNT",
+        environment: environment
+    )
+    let reflected = String(reflecting: provider)
+    #expect(!reflected.contains("selected-secret"))
+    #expect(!reflected.contains("account-1"))
+    #expect(!reflected.contains("must-not-be-retained"))
+    #expect(reflected.contains("<redacted>"))
+    let credential = try await provider.credential()
+    #expect(credential.accountID == "account-1")
+    #expect(credential.accessToken.unsafeRawValue == "selected-secret")
+
+#if os(macOS)
+    let loginProvider = try CodexRemoteCodexLoginCredentialProvider(
+        tokenEnvironmentVariable: "SELECTED_TOKEN",
+        accountIDEnvironmentVariable: "SELECTED_ACCOUNT",
+        environment: environment
+    )
+    let loginReflected = String(reflecting: loginProvider)
+    #expect(!loginReflected.contains("selected-secret"))
+    #expect(!loginReflected.contains("account-1"))
+    #expect(!loginReflected.contains("must-not-be-retained"))
+    #expect(loginReflected.contains("<redacted>"))
+    #expect(try await loginProvider.credential() == credential)
+#endif
+}
+
 @Test func remoteConfigurationRejectsCredentialExfiltrationTargets() throws {
     #expect(throws: CodexRemoteError.self) {
         try CodexRemoteConfiguration(baseURL: URL(string: "https://example.com/backend-api")!)

@@ -186,7 +186,7 @@ private actor ProcessJSONLTransport: CodexTransport {
     private let diagnosticContinuation: AsyncStream<CodexTransportDiagnostic>.Continuation
     private let executableURL: URL, arguments: [String], environment: [String: String]
     private let maximumFrameBytes: Int
-    private var process: Process?, input: FileHandle?, outputHandle: FileHandle?, errorHandle: FileHandle?, outputBuffer = Data(), stderrTail = Data(), closing = false
+    private var process: Process?, input: FileHandle?, shutdownReadHandle: FileHandle?, shutdownWriteHandle: FileHandle?, outputBuffer = Data(), stderrTail = Data(), closing = false
     private var finished = false
     private var shutdownTask: Task<Void, Never>?
     private var stdoutReadTask: Task<Void, Never>?, stderrReadTask: Task<Void, Never>?
@@ -202,32 +202,32 @@ private actor ProcessJSONLTransport: CodexTransport {
         let child = Process(), stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         child.executableURL = executableURL; child.arguments = arguments; child.environment = environment; child.standardInput = stdin; child.standardOutput = stdout; child.standardError = stderr
         do { try child.run() } catch { throw CodexError.transportClosed(error.localizedDescription) }
-        process = child; input = stdin.fileHandleForWriting; outputHandle = stdout.fileHandleForReading; errorHandle = stderr.fileHandleForReading
+        let shutdown = Pipe()
+        process = child; input = stdin.fileHandleForWriting; shutdownReadHandle = shutdown.fileHandleForReading; shutdownWriteHandle = shutdown.fileHandleForWriting
         child.terminationHandler = { [weak self] child in Task { await self?.processTerminated(child.terminationStatus) } }
         let outputReader = stdout.fileHandleForReading
+        let shutdownReader = shutdown.fileHandleForReading
         stdoutReadTask = Task.detached { [weak self] in
+            defer { try? outputReader.close() }
             do {
-                var bytes = [UInt8](repeating: 0, count: 64 * 1_024)
-                while !Task.isCancelled {
-                    let count = bytes.withUnsafeMutableBytes { Darwin.read(outputReader.fileDescriptor, $0.baseAddress, $0.count) }
-                    if count > 0 { await self?.receiveStdout(Data(bytes.prefix(count))); continue }
-                    if count == 0 { break }
-                    if errno == EINTR { continue }
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                stdoutLoop: while !Task.isCancelled {
+                    switch try interruptiblePipeRead(data: outputReader, shutdown: shutdownReader) {
+                    case .data(let data): await self?.receiveStdout(data)
+                    case .end, .shutdown: break stdoutLoop
+                    }
                 }
             } catch { await self?.readerFailed(error) }
             await self?.readerEnded(.stdout)
         }
         let errorReader = stderr.fileHandleForReading
         stderrReadTask = Task.detached { [weak self] in
+            defer { try? errorReader.close() }
             do {
-                var bytes = [UInt8](repeating: 0, count: 64 * 1_024)
-                while !Task.isCancelled {
-                    let count = bytes.withUnsafeMutableBytes { Darwin.read(errorReader.fileDescriptor, $0.baseAddress, $0.count) }
-                    if count > 0 { await self?.receiveStderr(Data(bytes.prefix(count))); continue }
-                    if count == 0 { break }
-                    if errno == EINTR { continue }
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                stderrLoop: while !Task.isCancelled {
+                    switch try interruptiblePipeRead(data: errorReader, shutdown: shutdownReader) {
+                    case .data(let data): await self?.receiveStderr(data)
+                    case .end, .shutdown: break stderrLoop
+                    }
                 }
             } catch { await self?.readerFailed(error) }
             await self?.readerEnded(.stderr)
@@ -239,24 +239,23 @@ private actor ProcessJSONLTransport: CodexTransport {
     }
     func close() async {
         closing = true
-        finish(nil)
+        beginFinish(nil)
         await shutdownTask?.value
-        process = nil
     }
     private func receiveStdout(_ data: Data) {
         guard !finished, !data.isEmpty else { return }; outputBuffer.append(data)
-        if outputBuffer.count > maximumFrameBytes, !outputBuffer.contains(0x0A) { finish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)); return }
+        if outputBuffer.count > maximumFrameBytes, !outputBuffer.contains(0x0A) { beginFinish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)); return }
         while let newline = outputBuffer.firstIndex(of: 0x0A) {
             var frame = Data(outputBuffer[..<newline]); outputBuffer.removeSubrange(...newline); if frame.last == 0x0D { frame.removeLast() }
-            if frame.count > maximumFrameBytes { finish(CodexError.frameTooLarge(actual: frame.count, limit: maximumFrameBytes)); return }
+            if frame.count > maximumFrameBytes { beginFinish(CodexError.frameTooLarge(actual: frame.count, limit: maximumFrameBytes)); return }
             if !frame.isEmpty { frameContinuation.yield(frame) }
         }
-        if outputBuffer.count > maximumFrameBytes { finish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)) }
+        if outputBuffer.count > maximumFrameBytes { beginFinish(CodexError.frameTooLarge(actual: outputBuffer.count, limit: maximumFrameBytes)) }
     }
     private func receiveStderr(_ data: Data) { guard !data.isEmpty else { return }; stderrTail.append(data); if stderrTail.count > 65_536 { stderrTail.removeFirst(stderrTail.count - 65_536) }; diagnosticContinuation.yield(.init(level: .debug, message: String(decoding: data, as: UTF8.self))) }
     private func readerFailed(_ error: Error) {
         guard !closing, !finished else { return }
-        finish(CodexError.transportClosed("process pipe read failed: \(error.localizedDescription)"))
+        beginFinish(CodexError.transportClosed("process pipe read failed: \(error.localizedDescription)"))
     }
     private func readerEnded(_ reader: Reader) {
         switch reader { case .stdout: stdoutEnded = true; case .stderr: stderrEnded = true }
@@ -268,19 +267,57 @@ private actor ProcessJSONLTransport: CodexTransport {
     }
     private func finishAfterProcessAndReadersEnd() {
         guard let code = terminationCode, stdoutEnded, stderrEnded else { return }
-        finish(closing || code == 0 ? nil : CodexError.transportClosed("process exited \(code): \(String(decoding: stderrTail, as: UTF8.self))"))
+        beginFinish(closing || code == 0 ? nil : CodexError.transportClosed("process exited \(code): \(String(decoding: stderrTail, as: UTF8.self))"))
     }
-    private func finish(_ error: Error?) {
+    private func beginFinish(_ error: Error?) {
         guard !finished else { return }; finished = true
         try? input?.close(); input = nil
-        stdoutReadTask?.cancel(); stderrReadTask?.cancel()
-        try? outputHandle?.close(); try? errorHandle?.close()
-        outputHandle = nil; errorHandle = nil
+        try? shutdownWriteHandle?.close(); shutdownWriteHandle = nil
         outputBuffer.removeAll()
-        if let child = process {
-            shutdownTask = Task { await terminateOwnedProcess(child) }
-        }
         if let error { frameContinuation.finish(throwing: error) } else { frameContinuation.finish() }; diagnosticContinuation.finish()
+        let child = process, stdoutTask = stdoutReadTask, stderrTask = stderrReadTask, shutdownReader = shutdownReadHandle
+        shutdownTask = Task { [weak self] in
+            if let child { await terminateOwnedProcess(child) }
+            stdoutTask?.cancel(); stderrTask?.cancel()
+            await stdoutTask?.value; await stderrTask?.value
+            try? shutdownReader?.close()
+            await self?.shutdownCompleted()
+        }
+    }
+    private func shutdownCompleted() {
+        stdoutReadTask = nil; stderrReadTask = nil
+        shutdownReadHandle = nil
+        process = nil
+    }
+}
+
+private enum InterruptiblePipeRead {
+    case data(Data)
+    case end
+    case shutdown
+}
+
+private func interruptiblePipeRead(data: FileHandle, shutdown: FileHandle) throws -> InterruptiblePipeRead {
+    var descriptors = [
+        pollfd(fd: data.fileDescriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+        pollfd(fd: shutdown.fileDescriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+    ]
+    while true {
+        let result = descriptors.withUnsafeMutableBufferPointer {
+            Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
+        }
+        if result < 0 {
+            if errno == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        if descriptors[1].revents != 0 { return .shutdown }
+        guard descriptors[0].revents != 0 else { continue }
+        var bytes = [UInt8](repeating: 0, count: 64 * 1_024)
+        let count = bytes.withUnsafeMutableBytes { Darwin.read(data.fileDescriptor, $0.baseAddress, $0.count) }
+        if count > 0 { return .data(Data(bytes.prefix(count))) }
+        if count == 0 { return .end }
+        if errno == EINTR { continue }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
 }
 

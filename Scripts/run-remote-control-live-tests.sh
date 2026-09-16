@@ -27,7 +27,9 @@ temporary_real_home="$(cd "$temporary_home" && pwd -P)"
 cleanup() {
   CODEX_HOME="$temporary_home" "$native_codex" remote-control stop --json >/dev/null 2>&1 || true
   if [[ -n "$environment_id" && -x "$repo_dir/.build/debug/codex-app-server-cli" ]]; then
-    "$repo_dir/.build/debug/codex-app-server-cli" remote remove "$environment_id" --auth-file "$source_auth" --json >/dev/null 2>&1 || true
+    if ! "$repo_dir/.build/debug/codex-app-server-cli" remote remove "$environment_id" --auth-file "$source_auth" --json >/dev/null 2>&1; then
+      echo "warning: could not remove Remote Control environment $environment_id; remove it manually" >&2
+    fi
   fi
   # Durable daemon bootstrap leaves its isolated updater alive after the app-server stops.
   # Match only this UUID-scoped temporary home before removing it.

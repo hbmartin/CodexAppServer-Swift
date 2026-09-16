@@ -7,7 +7,10 @@ Discover and connect to Codex app-server environments through Remote Control.
 ``CodexRemoteController`` uses account credentials for environment discovery. Pairing and WebSocket connections also require a device-bound ``CodexRemoteClientAuthorizationProvider``. This separation reflects the service contract: a normal account token does not enroll a controller and cannot replace the short-lived controller session or device-key proof.
 
 ```swift
-let credentials = try CodexRemoteCodexLoginCredentialProvider()
+let credentials = CodexRemoteEnvironmentCredentialProvider(
+    tokenVariable: "CODEX_ACCOUNT_TOKEN",
+    accountIDVariable: "CODEX_ACCOUNT_ID"
+)
 let controller = CodexRemoteController(
     credentials: credentials,
     authorizationProvider: applicationAuthorizationProvider
@@ -29,7 +32,7 @@ The supported API contains no public WHAM names. The hidden manual-pair route an
 
 Protocol-v3 transports use a fresh stream identity and sequence space for each connection. They preserve send order under bounded backpressure, segment large outbound messages, bound and reassemble inbound segments, suppress duplicates, and fail on sequence gaps or identity mismatches.
 
-``CodexRemoteSensitiveValue`` redacts normal descriptions, debug descriptions, and reflection. Read its underlying value only at a credential boundary. The default login provider rereads the Codex login file for every credential request so refreshed sessions are picked up.
+``CodexRemoteSensitiveValue`` redacts normal descriptions, debug descriptions, and reflection. Read its underlying value only at a credential boundary. On macOS, ``CodexRemoteCodexLoginCredentialProvider`` rereads the Codex login file for every credential request so refreshed sessions are picked up.
 
 ## Topics
 
