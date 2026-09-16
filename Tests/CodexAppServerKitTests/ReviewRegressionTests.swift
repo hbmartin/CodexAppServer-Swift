@@ -338,17 +338,49 @@ import CodexAppServerTestSupport
     await client.close()
 }
 
-@Test func ambiguousResponseFailureCannotBeRetried() async throws {
-    let transport = CodexScriptedTransport(), client = try await CodexClient.connectedTestClient(transport)
-    await transport.failResponses()
+@Test func ambiguousResponseFailureIsRecoverableOnlyThroughAFreshReplayHandle() async throws {
+    let first = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let second = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let third = CodexScriptedTransport(results: CodexScriptedTransport.defaultResults)
+    let sequence = CodexTransportSequence([first, second, third])
+    let client = CodexClient(transportFactory: sequence.factory, configuration: CodexClient.immediateReconnectConfiguration)
+    _ = try await client.connect()
+    await first.failResponses()
     let events = await client.subscribe(policy: .unbounded)
-    try await transport.inject(["id": 44, "method": "item/tool/requestUserInput", "params": ["threadId": "t", "questions": []]])
+    try await first.inject(["id": 44, "method": "account/request", "params": [:]])
     var iterator = events.events.makeAsyncIterator()
     guard case .serverRequest(let interaction) = try await iterator.next() else { Issue.record("missing request"); return }
     _ = try? await interaction.response.respond(.answers([:]))
     do { try await interaction.response.respond(.answers([:])); Issue.record("retried ambiguous response") }
     catch { #expect(error as? CodexError == .responseAlreadySent) }
-    #expect(await transport.messages().filter { $0["id"] == 44 && $0["result"] != nil }.count == 1)
+    #expect(await first.messages().filter { $0["id"] == 44 && $0["result"] != nil }.count == 1)
+
+    await first.finish(CodexError.transportClosed("drop after ambiguous response"))
+    for _ in 0..<2_000 {
+        if case .recoveryRequired = await client.connectionState() { break }
+        await Task.yield()
+    }
+    guard case .recoveryRequired(let recovery) = await client.connectionState() else {
+        Issue.record("missing recovery state"); await client.close(); return
+    }
+    #expect(recovery.unscopedRequestIDs == [44])
+
+    try await second.inject(["id": 44, "method": "account/request", "params": [:]])
+    var replayed: CodexPendingInteraction?
+    while replayed == nil, let event = try await iterator.next() {
+        if case .serverRequest(let interaction) = event { replayed = interaction }
+    }
+    let replayedInteraction = try #require(replayed)
+    #expect(replayedInteraction.generation != interaction.generation)
+    try await replayedInteraction.response.respond(.answers([:]))
+    #expect(await second.messages().filter { $0["id"] == 44 && $0["result"] != nil }.count == 1)
+    try await second.inject(["method": "serverRequest/resolved", "params": ["requestId": 44]])
+    await second.finish(CodexError.transportClosed("drop after resolution"))
+    for _ in 0..<2_000 {
+        if await client.connectionState() == .connected(generation: 3) { break }
+        await Task.yield()
+    }
+    #expect(await client.connectionState() == .connected(generation: 3))
     await client.close()
 }
 

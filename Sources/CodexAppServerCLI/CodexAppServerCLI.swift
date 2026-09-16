@@ -47,7 +47,14 @@ struct CLIExecutableOptions: ParsableArguments {
     func resolve() throws -> URL { try CodexCLIResolver().resolve(explicitURL: codex.map(URL.init(fileURLWithPath:))) }
 }
 struct JSONOutputOption: ParsableArguments { @Flag(name: .long, help: "Emit versioned JSON output.") var json = false }
-struct NotificationOption: ParsableArguments { @Option(name: .long, help: "HTTP notification configuration file.") var notifyConfig: String? }
+struct NotificationOption: ParsableArguments {
+    @Option(name: .customLong("notify-config"), help: "HTTP notification configuration file.") private var notifyConfigs: [String] = []
+    var notifyConfig: String? { notifyConfigs.first }
+    mutating func validate() throws {
+        guard notifyConfigs.count <= 1 else { throw ValidationError("--notify-config may be supplied only once") }
+        guard notifyConfigs.first?.isEmpty != true else { throw ValidationError("--notify-config requires a file path") }
+    }
+}
 struct RemoteAuthOptions: ParsableArguments {
     @Option(name: .long, help: "Environment variable containing the account access token.") var accountTokenEnv: String?
     @Option(name: .long, help: "Environment variable containing the account ID.") var accountIDEnv: String?
@@ -62,7 +69,7 @@ struct RemoteAuthOptions: ParsableArguments {
         return try CodexRemoteCodexLoginCredentialProvider(authFileURL: authFile.map(URL.init(fileURLWithPath:)))
     }
     func controller(requireAuthorization: Bool = false) throws -> CodexRemoteController {
-        let authorization = try authorizationHelper.map(RemoteAuthorizationHelper.init(path:))
+        let authorization = try authorizationHelper.map { try RemoteAuthorizationHelper(path: $0) }
         if requireAuthorization, authorization == nil {
             throw ValidationError("--authorization-helper is required; Remote Control pairing and connections use step-up enrollment and device-key signing")
         }
@@ -72,13 +79,15 @@ struct RemoteAuthOptions: ParsableArguments {
 
 struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
     let executableURL: URL
+    let timeout: Duration
 
-    init(path: String) throws {
+    init(path: String, timeout: Duration = .seconds(30)) throws {
         let url = URL(fileURLWithPath: path).standardizedFileURL
         guard url.path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: url.path) else {
             throw ValidationError("--authorization-helper must name an executable file")
         }
         executableURL = url
+        self.timeout = timeout
     }
 
     func authorization(for credential: CodexRemoteCredential, forceRefresh: Bool) async throws -> CodexRemoteClientAuthorization {
@@ -134,8 +143,9 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
 
     private func run(action: String, input: JSONValue) async throws -> JSONValue {
         let executableURL = self.executableURL
+        let timeout = self.timeout
         let inputData = try input.encoded()
-        return try await Task.detached {
+        let worker = Task.detached {
             let process = Process()
             let standardInput = Pipe(), standardOutput = Pipe(), standardError = Pipe()
             process.executableURL = executableURL
@@ -147,21 +157,71 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
             standardInput.fileHandleForWriting.write(inputData)
             standardInput.fileHandleForWriting.write(Data([0x0A]))
             try standardInput.fileHandleForWriting.close()
-            let outputTask = Task.detached { standardOutput.fileHandleForReading.readDataToEndOfFile() }
-            let errorTask = Task.detached { standardError.fileHandleForReading.readDataToEndOfFile() }
-            process.waitUntilExit()
-            let output = await outputTask.value
+            let outputTask = Task.detached { () -> (data: Data, exceededLimit: Bool) in
+                let handle = standardOutput.fileHandleForReading
+                defer { try? handle.close() }
+                let limit = 1_048_576
+                var data = Data()
+                while data.count <= limit {
+                    let count = min(64 * 1_024, limit + 1 - data.count)
+                    guard let chunk = try? handle.read(upToCount: count), !chunk.isEmpty else { break }
+                    data.append(chunk)
+                }
+                let exceededLimit = data.count > limit
+                if exceededLimit, process.isRunning {
+                    process.terminate()
+                    usleep(100_000)
+                    if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+                }
+                return (data, exceededLimit)
+            }
+            let errorTask = Task.detached {
+                let handle = standardError.fileHandleForReading
+                defer { try? handle.close() }
+                while let chunk = try? handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {}
+            }
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var timedOut = false
+            do {
+                while process.isRunning {
+                    try Task.checkCancellation()
+                    if clock.now >= deadline { timedOut = true; break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+            } catch is CancellationError {
+                await terminateAuthorizationHelper(process)
+                outputTask.cancel(); errorTask.cancel()
+                _ = await outputTask.value; _ = await errorTask.value
+                throw CancellationError()
+            }
+            if timedOut { await terminateAuthorizationHelper(process) }
+            else { await Task.detached { process.waitUntilExit() }.value }
+            let outputResult = await outputTask.value
             _ = await errorTask.value
+            if timedOut {
+                throw CodexRemoteError.authorizationRequired("authorization helper timed out for \(action)")
+            }
+            guard !outputResult.exceededLimit else {
+                throw CodexRemoteError.malformedResponse("authorization helper output exceeded 1 MiB")
+            }
             guard process.terminationStatus == 0 else {
                 throw CodexRemoteError.authorizationRequired("authorization helper failed for \(action) with status \(process.terminationStatus)")
             }
-            guard output.count <= 1_048_576 else {
-                throw CodexRemoteError.malformedResponse("authorization helper output exceeded 1 MiB")
-            }
-            do { return try JSONValue.decode(output) }
+            do { return try JSONValue.decode(outputResult.data) }
             catch { throw CodexRemoteError.malformedResponse("authorization helper returned invalid JSON for \(action)") }
-        }.value
+        }
+        return try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
     }
+}
+
+private func terminateAuthorizationHelper(_ process: Process) async {
+    if process.isRunning {
+        process.terminate()
+        try? await Task.sleep(for: .milliseconds(100))
+        if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+    }
+    await Task.detached { process.waitUntilExit() }.value
 }
 
 @main
@@ -256,7 +316,8 @@ struct CodexAppServerCLI: AsyncParsableCommand {
             func run() async throws {
                 let controller = try auth.controller(requireAuthorization: true); let chosen = try await selectRemoteHost(controller: controller, requested: environmentID, machineMode: output.json)
                 let session = try await controller.connect(environmentID: chosen)
-                try await runInteractive(client: session.client, notificationPath: notification.notifyConfig, json: output.json)
+                do { try await runInteractive(client: session.client, notificationPath: notification.notifyConfig, json: output.json) }
+                catch { await session.close(); throw error }
                 await session.close()
             }
         }
@@ -271,14 +332,6 @@ struct CodexAppServerCLI: AsyncParsableCommand {
         }
     }
 
-    static func notificationConfigurationPath(in arguments: [String]) throws -> String? {
-        let matches = arguments.indices.filter { arguments[$0] == "--notify-config" }
-        guard matches.count <= 1 else { throw CodexError.invalidConfiguration("--notify-config may be supplied only once") }
-        guard let index = matches.first else { return nil }
-        guard arguments.indices.contains(index + 1), !arguments[index + 1].isEmpty, !arguments[index + 1].hasPrefix("--") else { throw CodexError.invalidConfiguration("--notify-config requires a file path") }
-        return arguments[index + 1]
-    }
-
     static func decodeMachineCommand(_ line: String) throws -> CLIMachineCommand {
         let input = try JSONValue.decode(Data(line.utf8))
         guard input["schemaVersion"]?.intValue == 1 else { throw CodexError.invalidArgument("schemaVersion must be 1") }
@@ -290,11 +343,16 @@ struct CodexAppServerCLI: AsyncParsableCommand {
     }
 }
 
-private func runInteractive(factory: CodexTransportFactory, notificationPath: String?, json: Bool) async throws {
+func runInteractive(factory: CodexTransportFactory, notificationPath: String?, json: Bool) async throws {
     let registry = CodexDynamicToolRegistry(tools: [.init(name: "sdk_echo", description: "Echo JSON input", inputSchema: ["type": "object"]) { .text(String(decoding: try $0.encoded(sortedKeys: true), as: UTF8.self)) }])
-    let client = CodexClient(transportFactory: factory, dynamicTools: registry); _ = try await client.connect()
-    defer { Task { await client.close() } }
-    try await runInteractive(client: client, notificationPath: notificationPath, json: json)
+    let client = CodexClient(transportFactory: factory, dynamicTools: registry)
+    do {
+        _ = try await client.connect()
+        try await runInteractive(client: client, notificationPath: notificationPath, json: json)
+    } catch {
+        await client.close()
+        throw error
+    }
     await client.close()
 }
 
@@ -442,5 +500,10 @@ private func selectRemoteHost(controller: CodexRemoteController, requested: Stri
     for (index, host) in online.enumerated() { print("\(index + 1). \(host.name ?? host.id) [\(host.id)]") }
     print("Host: ", terminator: ""); guard let input = readLine(), let index = Int(input), online.indices.contains(index - 1) else { throw ValidationError("invalid host selection") }
     return online[index - 1].id
+}
+#else
+@main
+private enum CodexAppServerCLIUnsupportedPlatform {
+    static func main() {}
 }
 #endif

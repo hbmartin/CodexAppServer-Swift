@@ -114,12 +114,15 @@ func invalidNotificationConfigurationsAreRejected(source: String) {
 }
 
 @Test func notificationArgumentValidation() throws {
-    #expect(try CodexAppServerCLI.notificationConfigurationPath(in: ["--daemon"]) == nil)
-    #expect(try CodexAppServerCLI.notificationConfigurationPath(in: ["--daemon", "--notify-config", "notify.json"]) == "notify.json")
-    #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config"]) }
-    #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config", ""]) }
-    #expect(throws: CodexError.self) { try CodexAppServerCLI.notificationConfigurationPath(in: ["--notify-config", "a", "--notify-config", "b"]) }
-    #expect(try CodexAppServerCLI.notificationConfigurationPath(in: ["status", "--notify-config", "notify.json"]) == "notify.json")
+    let plain = try #require(try CodexAppServerCLI.parseAsRoot(["connect", "daemon"]) as? CodexAppServerCLI.Connect.Managed)
+    #expect(plain.notification.notifyConfig == nil)
+    let configured = try #require(try CodexAppServerCLI.parseAsRoot(["connect", "daemon", "--notify-config", "notify.json"]) as? CodexAppServerCLI.Connect.Managed)
+    #expect(configured.notification.notifyConfig == "notify.json")
+    #expect(throws: (any Error).self) { try CodexAppServerCLI.parseAsRoot(["connect", "daemon", "--notify-config"]) }
+    #expect(throws: (any Error).self) { try CodexAppServerCLI.parseAsRoot(["connect", "daemon", "--notify-config", ""]) }
+    #expect(throws: (any Error).self) {
+        try CodexAppServerCLI.parseAsRoot(["connect", "daemon", "--notify-config", "a", "--notify-config", "b"])
+    }
 }
 
 @Test(arguments: [

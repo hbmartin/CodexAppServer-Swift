@@ -27,11 +27,14 @@ actor CodexRemoteConnection: CodexTransport {
     private var outboundQueue: Deque<Outbound> = []
     private var waitingOutbound: Deque<Outbound> = []
     private var inFlight: Outbound?
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
+    private var closing = false
     private var closed = false
 
     private enum OutboundPayload: Sendable {
         case message(Data)
         case ping
+        case close
     }
 
     private struct Outbound: Sendable {
@@ -71,6 +74,7 @@ actor CodexRemoteConnection: CodexTransport {
     func start() async throws {
         guard socket == nil, !closed else { throw CodexRemoteError.closed }
         guard !authorization.isExpired() else { throw CodexRemoteError.authorizationExpired }
+        try validateSegmentConfiguration()
 
         let url = try webSocketURL()
         var request = URLRequest(url: url, timeoutInterval: configuration.requestTimeout)
@@ -114,7 +118,7 @@ actor CodexRemoteConnection: CodexTransport {
     }
 
     func send(frame: Data) async throws {
-        guard !closed, socket != nil else { throw CodexRemoteError.closed }
+        guard !closing, !closed, socket != nil else { throw CodexRemoteError.closed }
         guard frame.count <= configuration.maximumFrameBytes else {
             throw CodexError.frameTooLarge(actual: frame.count, limit: configuration.maximumFrameBytes)
         }
@@ -128,22 +132,26 @@ actor CodexRemoteConnection: CodexTransport {
 
     func close() async {
         guard !closed else { return }
-        if let socket {
-            do {
-                let sequence = try takeOutboundSequence()
-                let envelope: JSONValue = [
-                    "type": "client_closed",
-                    "client_id": .string(authorization.clientID),
-                    "stream_id": .string(streamID),
-                    "env_id": .string(environmentID),
-                    "seq_id": .number(Decimal(sequence)),
-                ]
-                try await socket.send(.string(String(decoding: try envelope.encoded(), as: UTF8.self)))
-            } catch {
+        if closing {
+            await withCheckedContinuation { closeWaiters.append($0) }
+            return
+        }
+        closing = true
+        guard socket != nil else {
+            finish(nil)
+            return
+        }
+        let id = UUID()
+        do {
+            try await withCheckedThrowingContinuation { continuation in
+                enqueue(.init(id: id, payload: .close, continuation: continuation))
+            }
+        } catch {
+            if !closed {
                 diagnosticContinuation.yield(.init(level: .warning, message: "Could not send Remote Control close envelope: \(error.localizedDescription)"))
             }
         }
-        finish(nil)
+        if !closed { finish(nil) }
     }
 
     private func enqueue(_ outbound: Outbound) {
@@ -184,6 +192,15 @@ actor CodexRemoteConnection: CodexTransport {
                         "skip_history": true,
                     ]
                     try await socket.send(.string(String(decoding: try envelope.encoded(), as: UTF8.self)))
+                case .close:
+                    let envelope: JSONValue = [
+                        "type": "client_closed",
+                        "client_id": .string(authorization.clientID),
+                        "stream_id": .string(streamID),
+                        "env_id": .string(environmentID),
+                        "seq_id": .number(Decimal(sequence)),
+                    ]
+                    try await socket.send(.string(String(decoding: try envelope.encoded(), as: UTF8.self)))
                 }
                 if inFlight?.id == next.id {
                     next.continuation?.resume()
@@ -195,9 +212,21 @@ actor CodexRemoteConnection: CodexTransport {
                     inFlight = nil
                 }
             } catch {
+                if case .close = next.payload {
+                    if inFlight?.id == next.id {
+                        next.continuation?.resume()
+                        inFlight = nil
+                    }
+                    diagnosticContinuation.yield(.init(level: .warning, message: "Could not send Remote Control close envelope: \(error.localizedDescription)"))
+                    finish(nil)
+                    return
+                }
                 if inFlight?.id == next.id {
                     next.continuation?.resume(throwing: error)
                     inFlight = nil
+                }
+                if closing {
+                    diagnosticContinuation.yield(.init(level: .warning, message: "Could not send Remote Control close envelope: \(error.localizedDescription)"))
                 }
                 finish(error)
                 return
@@ -220,28 +249,115 @@ actor CodexRemoteConnection: CodexTransport {
         let unsegmented = try base.encoded()
         if unsegmented.count <= configuration.maximumSegmentBytes { return [unsegmented] }
 
-        let count = max(1, Int(ceil(Double(sourceData.count) / Double(configuration.maximumSegmentBytes))))
+        let capacity = try outboundChunkCapacity(sourceCount: sourceData.count, sequence: sequence)
+        let count = ceilingDivision(sourceData.count, by: capacity)
         var messages: [Data] = []
         messages.reserveCapacity(count)
         for index in 0..<count {
-            let lower = index * configuration.maximumSegmentBytes
-            let upper = min(lower + configuration.maximumSegmentBytes, sourceData.count)
+            let lower = index * capacity
+            let upper = min(lower + capacity, sourceData.count)
             let chunk = sourceData.subdata(in: lower..<upper)
+            let encoded = try clientChunkEnvelope(
+                sequence: sequence,
+                segment: index,
+                count: count,
+                messageSize: sourceData.count,
+                chunk: chunk.base64EncodedString()
+            ).encoded()
+            guard encoded.count <= configuration.maximumSegmentBytes else {
+                throw CodexRemoteError.invalidConfiguration("encoded Remote Control chunk exceeds maximumSegmentBytes")
+            }
+            messages.append(encoded)
+        }
+        return messages
+    }
+
+    private func validateSegmentConfiguration() throws {
+        _ = try outboundChunkCapacity(sourceCount: configuration.maximumFrameBytes, sequence: Int64.max - 1)
+        guard inboundChunkCapacity(messageSize: configuration.maximumFrameBytes) != nil else {
+            throw CodexRemoteError.invalidConfiguration("maximumSegmentBytes cannot fit Remote Control chunk metadata")
+        }
+    }
+
+    private func outboundChunkCapacity(sourceCount: Int, sequence: Int64) throws -> Int {
+        var capacity = configuration.maximumSegmentBytes
+        var previousCount = 0
+        while true {
+            let count = ceilingDivision(sourceCount, by: capacity)
+            let metadata = try clientChunkEnvelope(
+                sequence: sequence,
+                segment: max(0, count - 1),
+                count: count,
+                messageSize: sourceCount,
+                chunk: ""
+            ).encoded().count
+            guard metadata < configuration.maximumSegmentBytes else {
+                throw CodexRemoteError.invalidConfiguration("maximumSegmentBytes cannot fit Remote Control chunk metadata")
+            }
+            let availableBase64Bytes = configuration.maximumSegmentBytes - metadata
+            let derivedCapacity = (availableBase64Bytes / 4) * 3
+            guard derivedCapacity > 0 else {
+                throw CodexRemoteError.invalidConfiguration("maximumSegmentBytes cannot fit a Remote Control chunk payload")
+            }
+            let nextCapacity = min(capacity, derivedCapacity)
+            if nextCapacity == capacity, count == previousCount { return capacity }
+            previousCount = count
+            capacity = nextCapacity
+        }
+    }
+
+    private func inboundChunkCapacity(messageSize: Int) -> Int? {
+        var capacity = configuration.maximumSegmentBytes
+        var previousCount = 0
+        while true {
+            let count = ceilingDivision(messageSize, by: capacity)
             let envelope: JSONValue = [
-                "type": "client_message_chunk",
+                "type": "server_message_chunk",
                 "client_id": .string(authorization.clientID),
                 "stream_id": .string(streamID),
                 "env_id": .string(environmentID),
-                "skip_history": false,
-                "seq_id": .number(Decimal(sequence)),
-                "segment_id": .number(Decimal(index)),
+                "cursor": .null,
+                "seq_id": .number(Decimal(Int64.max)),
+                "segment_id": .number(Decimal(max(0, count - 1))),
                 "segment_count": .number(Decimal(count)),
-                "message_size_bytes": .number(Decimal(sourceData.count)),
-                "message_chunk_base64": .string(chunk.base64EncodedString()),
+                "message_size_bytes": .number(Decimal(messageSize)),
+                "message_chunk_base64": .string(""),
             ]
-            messages.append(try envelope.encoded())
+            guard let metadata = try? envelope.encoded().count,
+                  metadata < configuration.maximumSegmentBytes else { return nil }
+            let availableBase64Bytes = configuration.maximumSegmentBytes - metadata
+            let derivedCapacity = (availableBase64Bytes / 4) * 3
+            guard derivedCapacity > 0 else { return nil }
+            let nextCapacity = min(capacity, derivedCapacity)
+            if nextCapacity == capacity, count == previousCount { return capacity }
+            previousCount = count
+            capacity = nextCapacity
         }
-        return messages
+    }
+
+    private func clientChunkEnvelope(
+        sequence: Int64,
+        segment: Int,
+        count: Int,
+        messageSize: Int,
+        chunk: String
+    ) -> JSONValue {
+        [
+            "type": "client_message_chunk",
+            "client_id": .string(authorization.clientID),
+            "stream_id": .string(streamID),
+            "env_id": .string(environmentID),
+            "skip_history": false,
+            "seq_id": .number(Decimal(sequence)),
+            "segment_id": .number(Decimal(segment)),
+            "segment_count": .number(Decimal(count)),
+            "message_size_bytes": .number(Decimal(messageSize)),
+            "message_chunk_base64": .string(chunk),
+        ]
+    }
+
+    private func ceilingDivision(_ value: Int, by divisor: Int) -> Int {
+        value / divisor + (value % divisor == 0 ? 0 : 1)
     }
 
     private func promoteWaiting() {
@@ -397,14 +513,37 @@ actor CodexRemoteConnection: CodexTransport {
     }
 
     private func translateRemoteError(_ payload: JSONValue) -> JSONValue {
-        guard payload["type"]?.stringValue == "error", let id = pendingRequestIDs.popFirst(), var error = payload.objectValue else {
+        guard payload["type"]?.stringValue == "error" else {
             if let id = responseID(in: payload), let index = pendingRequestIDs.firstIndex(of: id) {
                 pendingRequestIDs.remove(at: index)
             }
             return payload
         }
-        error.removeValue(forKey: "type")
-        return ["id": id, "error": .object(error)]
+
+        let id: JSONValue
+        switch payload["id"] {
+        case .string, .number: id = payload["id"]!
+        default:
+            diagnosticContinuation.yield(.init(level: .warning, message: "Received an unmatched Remote Control error without a string or numeric id"))
+            return payload
+        }
+        if let index = pendingRequestIDs.firstIndex(of: id) {
+            pendingRequestIDs.remove(at: index)
+        } else {
+            diagnosticContinuation.yield(.init(level: .warning, message: "Received an unmatched Remote Control error for id \(id)"))
+        }
+
+        let details: JSONValue
+        if let nested = payload["error"], nested.objectValue != nil {
+            details = nested
+        } else if var flat = payload.objectValue {
+            flat.removeValue(forKey: "type")
+            flat.removeValue(forKey: "id")
+            details = .object(flat)
+        } else {
+            details = ["message": "Remote Control request failed"]
+        }
+        return ["id": id, "error": details]
     }
 
     private func yield(payload: JSONValue) throws {
@@ -432,10 +571,10 @@ actor CodexRemoteConnection: CodexTransport {
     }
 
     private func pingLoop() async {
-        while !Task.isCancelled, !closed {
+        while !Task.isCancelled, !closing, !closed {
             do { try await Task.sleep(for: configuration.pingInterval) }
             catch { return }
-            guard !Task.isCancelled, !closed else { return }
+            guard !Task.isCancelled, !closing, !closed else { return }
             if outboundQueue.count < configuration.maximumOutboundFrames {
                 enqueue(.init(id: UUID(), payload: .ping, continuation: nil))
             } else {
@@ -548,7 +687,8 @@ actor CodexRemoteConnection: CodexTransport {
     private var wireMessageLimit: Int { max(256 * 1_024, configuration.maximumSegmentBytes * 2) }
 
     private var maximumInboundSegmentCount: Int {
-        Int(ceil(Double(configuration.maximumFrameBytes) / Double(configuration.maximumSegmentBytes))) + 1
+        guard let capacity = inboundChunkCapacity(messageSize: configuration.maximumFrameBytes) else { return 0 }
+        return ceilingDivision(configuration.maximumFrameBytes, by: capacity)
     }
 
     private func finish(_ error: Error?) {
@@ -573,6 +713,9 @@ actor CodexRemoteConnection: CodexTransport {
         for item in waitingOutbound { item.continuation?.resume(throwing: failure) }
         outboundQueue.removeAll()
         waitingOutbound.removeAll()
+        let waiters = closeWaiters
+        closeWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
         if let error { frameContinuation.finish(throwing: error) }
         else { frameContinuation.finish() }
         diagnosticContinuation.finish()

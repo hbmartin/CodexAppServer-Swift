@@ -261,6 +261,33 @@ private func metadata(_ path: String, symlink: Bool = false) -> JSONValue {
     await client.close()
 }
 
+@Test func detailedDirectoryListingCancellationStopsSchedulingMetadataWork() async throws {
+    let root = URL(fileURLWithPath: "/tmp/workspace")
+    let names = (0..<100).map { "child-\($0)" }
+    let listing = JSONValue.object(["entries": .array(names.map { ["fileName": .string($0), "isDirectory": false, "isFile": true] })])
+    let transport = CodexScriptedTransport(results: ["fs/readDirectory": listing], requestHandler: { request in
+        guard request["method"] == "fs/getMetadata", let path = request["params"]?["path"]?.stringValue else { return nil }
+        return metadata(path)
+    })
+    let client = try await CodexClient.connectedTestClient(transport)
+    let directoryGate = CodexTestGate(), metadataGate = CodexTestGate()
+    await transport.hold(method: "fs/readDirectory", at: directoryGate)
+    let roots = try CodexWorkspaceRoots([root])
+    let listingTask = Task {
+        try await client.listDirectory(path: root.path, roots: roots, detail: .metadata(maximumConcurrentRequests: 4))
+    }
+    try await directoryGate.waitForWaiters(1, timeout: .seconds(5))
+    await transport.hold(method: "fs/getMetadata", at: metadataGate)
+    await directoryGate.release()
+    try await metadataGate.waitForWaiters(4, timeout: .seconds(5))
+    listingTask.cancel()
+    await metadataGate.release()
+    await #expect(throws: CancellationError.self) { try await listingTask.value }
+    let metadataRequests = await transport.messages().filter { $0["method"] == "fs/getMetadata" }.count
+    #expect(metadataRequests == 5) // One root check plus the four already-running child requests.
+    await client.close()
+}
+
 @Test(arguments: ["thread/turns/list", "thread/items/list"])
 func malformedHistoryPageStillAllowsFetchingNextPage(method: String) async throws {
     let valid: JSONValue = method == "thread/turns/list" ? ["id": "u"] : ["turnId": "u", "item": ["id": "i"]]

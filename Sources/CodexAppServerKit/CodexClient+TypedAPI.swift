@@ -204,9 +204,10 @@ public extension CodexClient {
         }
         var enriched = children
         var diagnostics: [CodexDirectoryDiagnostic] = []
-        await withTaskGroup(of: (Int, Result<CodexFileMetadata, any Error>).self) { group in
+        try await withThrowingTaskGroup(of: (Int, Result<CodexFileMetadata, any Error>).self) { group in
             var nextIndex = 0
-            func addNext() {
+            func addNext() throws {
+                try Task.checkCancellation()
                 let index = nextIndex
                 nextIndex += 1
                 let childPath = children[index].path
@@ -214,14 +215,17 @@ public extension CodexClient {
                     do {
                         let metadata = try await self.rawRequest(method: "fs/getMetadata", params: ["path": .string(childPath)])
                         return (index, .success(try CodexFileMetadata(path: childPath, raw: metadata)))
+                    } catch is CancellationError {
+                        throw CancellationError()
                     } catch {
+                        if Task.isCancelled { throw CancellationError() }
                         return (index, .failure(error))
                     }
                 }
             }
 
-            for _ in 0..<min(maximumConcurrentMetadataRequests, children.count) { addNext() }
-            while let (index, outcome) = await group.next() {
+            for _ in 0..<min(maximumConcurrentMetadataRequests, children.count) { try addNext() }
+            while let (index, outcome) = try await group.next() {
                 switch outcome {
                 case .success(let metadata):
                     enriched[index].isDirectory = metadata.isDirectory
@@ -233,7 +237,7 @@ public extension CodexClient {
                 case .failure(let error):
                     diagnostics.append(.init(path: children[index].path, message: error.localizedDescription))
                 }
-                if nextIndex < children.count { addNext() }
+                if nextIndex < children.count { try addNext() }
             }
         }
         diagnostics.sort { $0.path < $1.path }

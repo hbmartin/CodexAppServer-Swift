@@ -70,6 +70,7 @@ public actor CodexClient {
     var explicitSubscriptionIntents: Set<String> = []
     private var streamSubscriptionIntentCounts: [String: Int] = [:]
     private var pendingInteractions: [JSONValue: CodexLostInteraction] = [:]
+    private var inFlightInteractions: [JSONValue: CodexLostInteraction] = [:]
     private var lostInteractions: [JSONValue: CodexLostInteraction] = [:]
     private var interactionHandler: CodexInteractionHandler?
     private var initializationResult: JSONValue?
@@ -417,6 +418,7 @@ public actor CodexClient {
         case .serverRequestResolved:
             if let id = params["requestId"] {
                 pendingInteractions[id] = nil
+                inFlightInteractions[id] = nil
                 lostInteractions[id] = nil
                 updateRecoveryStateIfResolved()
             }
@@ -481,6 +483,7 @@ public actor CodexClient {
     private func routeServerRequest(id: JSONValue, method: String, params: JSONValue) async {
         let record = CodexLostInteraction(requestID: id, method: method, threadID: params["threadId"]?.stringValue)
         lostInteractions[id] = nil
+        inFlightInteractions[id] = nil
         pendingInteractions[id] = record
         updateRecoveryStateIfResolved()
         if method == "item/tool/call" { runDynamicTool(id: id, params: params); return }
@@ -532,10 +535,12 @@ public actor CodexClient {
 
     public func respondToServerRequest(id: JSONValue, response: CodexInteractionResponse, generation expectedGeneration: UInt64) async throws {
         guard expectedGeneration == generation else { throw CodexError.staleResponseHandle }
-        guard pendingInteractions[id] != nil else { throw CodexError.staleResponseHandle }
+        guard let record = pendingInteractions[id] else { throw CodexError.staleResponseHandle }
         guard transportInitialized, transport != nil, !intentionallyClosing else { throw CodexError.disconnected }
-        // A send error is ambiguous: reserve permanently rather than risk replying twice.
+        // The handle remains one-shot, but the record stays recoverable until the server confirms
+        // resolution. If delivery is ambiguous, transport teardown moves it to lostInteractions.
         pendingInteractions[id] = nil
+        inFlightInteractions[id] = record
         switch response {
         case .error(let code, let message, let data):
             var error: [String: JSONValue] = ["code": .number(Decimal(code)), "message": .string(message)]
@@ -601,10 +606,11 @@ public actor CodexClient {
         }
     }
     private func setState(_ newState: CodexConnectionState) { state = newState; emit(.connection(newState)) }
-    private func invalidateInteractions() { pendingInteractions.removeAll(); for task in dynamicToolTasks.values { task.cancel() }; dynamicToolTasks.removeAll() }
+    private func invalidateInteractions() { pendingInteractions.removeAll(); inFlightInteractions.removeAll(); for task in dynamicToolTasks.values { task.cancel() }; dynamicToolTasks.removeAll() }
 
     private func preserveLostInteractions() {
         for (id, record) in pendingInteractions { lostInteractions[id] = record }
+        for (id, record) in inFlightInteractions { lostInteractions[id] = record }
     }
 
     private func recoveryContext() -> CodexRecoveryContext? {

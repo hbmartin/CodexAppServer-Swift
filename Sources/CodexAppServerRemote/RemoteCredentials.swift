@@ -1,32 +1,44 @@
 import Foundation
 import CodexAppServerKit
 
-public struct CodexRemoteEnvironmentCredentialProvider: CodexRemoteCredentialProvider {
-    public var tokenVariable: String
-    public var accountIDVariable: String
-    private let environment: [String: String]
+public struct CodexRemoteEnvironmentCredentialProvider: CodexRemoteCredentialProvider, CustomReflectable {
+    public let tokenVariable: String
+    public let accountIDVariable: String
+    private let token: CodexRemoteSensitiveValue?
+    private let accountID: String?
 
     public init(tokenVariable: String, accountIDVariable: String, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.tokenVariable = tokenVariable
         self.accountIDVariable = accountIDVariable
-        self.environment = environment
+        token = environment[tokenVariable].map(CodexRemoteSensitiveValue.init)
+        accountID = environment[accountIDVariable]
     }
 
     public func credential() async throws -> CodexRemoteCredential {
-        guard let token = environment[tokenVariable], !token.isEmpty else {
+        guard let token, !token.unsafeRawValue.isEmpty else {
             throw CodexRemoteError.invalidConfiguration("missing environment variable \(tokenVariable)")
         }
-        guard let accountID = environment[accountIDVariable], !accountID.isEmpty else {
+        guard let accountID, !accountID.isEmpty else {
             throw CodexRemoteError.invalidConfiguration("missing environment variable \(accountIDVariable)")
         }
-        return try .init(accountID: accountID, accessToken: .init(token))
+        return try .init(accountID: accountID, accessToken: token)
+    }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: [
+            "tokenVariable": tokenVariable,
+            "accountIDVariable": accountIDVariable,
+            "credential": "<redacted>",
+        ], displayStyle: .struct)
     }
 }
 
 #if os(macOS)
-public struct CodexRemoteCodexLoginCredentialProvider: CodexRemoteCredentialProvider {
+public struct CodexRemoteCodexLoginCredentialProvider: CodexRemoteCredentialProvider, CustomReflectable {
     private let environmentVariables: (token: String, account: String)?
-    private let environment: [String: String]
+    private let environmentToken: CodexRemoteSensitiveValue?
+    private let environmentAccountID: String?
+    private let codexHome: String?
     private let authFileURL: URL?
 
     public init(tokenEnvironmentVariable: String? = nil, accountIDEnvironmentVariable: String? = nil, authFileURL: URL? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) throws {
@@ -34,23 +46,27 @@ public struct CodexRemoteCodexLoginCredentialProvider: CodexRemoteCredentialProv
             throw CodexRemoteError.invalidConfiguration("token and account-ID environment variables must be supplied together")
         }
         environmentVariables = tokenEnvironmentVariable.map { ($0, accountIDEnvironmentVariable!) }
-        self.environment = environment
+        environmentToken = tokenEnvironmentVariable.flatMap { environment[$0] }.map(CodexRemoteSensitiveValue.init)
+        environmentAccountID = accountIDEnvironmentVariable.flatMap { environment[$0] }
+        codexHome = environment["CODEX_HOME"]
         self.authFileURL = authFileURL
     }
 
     public func credential() async throws -> CodexRemoteCredential {
         if let (tokenVariable, accountVariable) = environmentVariables {
-            return try await CodexRemoteEnvironmentCredentialProvider(
-                tokenVariable: tokenVariable,
-                accountIDVariable: accountVariable,
-                environment: environment
-            ).credential()
+            guard let environmentToken, !environmentToken.unsafeRawValue.isEmpty else {
+                throw CodexRemoteError.invalidConfiguration("missing environment variable \(tokenVariable)")
+            }
+            guard let environmentAccountID, !environmentAccountID.isEmpty else {
+                throw CodexRemoteError.invalidConfiguration("missing environment variable \(accountVariable)")
+            }
+            return try .init(accountID: environmentAccountID, accessToken: environmentToken)
         }
 
         let fileURL: URL
         if let authFileURL {
             fileURL = authFileURL
-        } else if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
+        } else if let codexHome, !codexHome.isEmpty {
             fileURL = URL(fileURLWithPath: codexHome, isDirectory: true).appending(path: "auth.json")
         } else {
             fileURL = FileManager.default.homeDirectoryForCurrentUser
@@ -80,6 +96,13 @@ public struct CodexRemoteCodexLoginCredentialProvider: CodexRemoteCredentialProv
             throw CodexRemoteError.invalidConfiguration("Codex login has no account ID")
         }
         return try .init(accountID: accountID, accessToken: .init(token))
+    }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: [
+            "source": environmentVariables == nil ? "Codex login file" : "environment variables",
+            "credential": "<redacted>",
+        ], displayStyle: .struct)
     }
 }
 #endif

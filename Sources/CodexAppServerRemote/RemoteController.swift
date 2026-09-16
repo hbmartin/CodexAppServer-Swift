@@ -226,7 +226,7 @@ public actor CodexRemoteController {
         acceptedStatusCodes: Set<Int> = [],
         credential fixedCredential: CodexRemoteCredential? = nil
     ) async throws -> (JSONValue, CodexRemoteCredential) {
-        let attempts = safeRead ? configuration.maximumReadAttempts : 1
+        let attempts = safeRead ? max(1, configuration.maximumReadAttempts) : 1
         var lastError: Error?
         var retriedUnauthorized = false
         for attempt in 1...attempts {
