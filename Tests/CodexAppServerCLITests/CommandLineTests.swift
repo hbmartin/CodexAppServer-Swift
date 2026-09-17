@@ -138,6 +138,53 @@ else:
     #expect(try await helper.authorization(for: credential, forceRefresh: false).clientID == "client")
 }
 
+@Test func remoteAuthorizationHelperReportsNonzeroExitBeforeBrokenStdinPipe() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try writeAuthorizationHelper(
+        """
+        #!/usr/bin/python3
+        import os, time
+        os.close(0)
+        time.sleep(0.1)
+        raise SystemExit(23)
+        """,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path)
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
+    await #expect(throws: CodexRemoteError.authorizationRequired("authorization helper failed for authorize with status 23")) {
+        _ = try await helper.authorization(for: credential, forceRefresh: false)
+    }
+}
+
+@Test func remoteAuthorizationHelperPreservesBrokenStdinPipeAfterSuccessfulExit() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try writeAuthorizationHelper(
+        #"""
+        #!/usr/bin/python3
+        import json, os, time
+        os.close(0)
+        time.sleep(0.1)
+        print(json.dumps({"clientID":"client","sessionToken":"token","requiresDeviceKeyProof":False}), flush=True)
+        """#,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path)
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
+    do {
+        _ = try await helper.authorization(for: credential, forceRefresh: false)
+        Issue.record("Expected the incomplete authorization-helper stdin write to fail")
+    } catch let error as POSIXError {
+        #expect(error.code == .EPIPE)
+    } catch {
+        Issue.record("Expected EPIPE, received \(error)")
+    }
+}
+
 @Test func remoteAuthorizationHelperRejectsOversizedStdout() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

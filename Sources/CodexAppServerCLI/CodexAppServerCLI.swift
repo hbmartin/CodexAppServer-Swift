@@ -233,10 +233,10 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
             guard !outputResult.exceededLimit else {
                 throw CodexRemoteError.malformedResponse("authorization helper output exceeded 1 MiB")
             }
-            if case .failure(let error) = inputResult { throw error }
             guard process.terminationStatus == 0 else {
                 throw CodexRemoteError.authorizationRequired("authorization helper failed for \(action) with status \(process.terminationStatus)")
             }
+            if case .failure(let error) = inputResult { throw error }
             do { return try JSONValue.decode(outputResult.data) }
             catch { throw CodexRemoteError.malformedResponse("authorization helper returned invalid JSON for \(action)") }
         }

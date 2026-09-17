@@ -139,7 +139,7 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
     try await transport.start()
-    try await waitForForwardFile(launches)
+    try await waitForForwardFile(launches, expectedContents: "started\n")
     await transport.close()
     await #expect(throws: CodexError.alreadyConnected) { try await transport.start() }
     let launchCount = try String(contentsOf: launches, encoding: .utf8).split(separator: "\n").count
@@ -235,12 +235,17 @@ private func forwardTestScript(directory: URL, source: String) throws -> URL {
     return script
 }
 
-private func waitForForwardFile(_ url: URL) async throws {
+private func waitForForwardFile(_ url: URL, expectedContents: String? = nil) async throws {
     for _ in 0..<500 {
-        if FileManager.default.fileExists(atPath: url.path) { return }
+        if let expectedContents {
+            if (try? String(contentsOf: url, encoding: .utf8)) == expectedContents { return }
+        } else if FileManager.default.fileExists(atPath: url.path) {
+            return
+        }
         try await Task.sleep(for: .milliseconds(10))
     }
-    throw CodexError.transportClosed("test fixture did not create \(url.lastPathComponent)")
+    let expectation = expectedContents.map { " with contents \(String(reflecting: $0))" } ?? ""
+    throw CodexError.transportClosed("test fixture did not create \(url.lastPathComponent)\(expectation)")
 }
 
 @Test(arguments: [false, true])
