@@ -342,6 +342,9 @@ public actor CodexClient {
 
     private func sendEnvelope(_ envelope: JSONValue) async throws {
         guard let transport else { throw CodexError.disconnected }
+        try await sendEnvelope(envelope, using: transport)
+    }
+    private func sendEnvelope(_ envelope: JSONValue, using transport: any CodexTransport) async throws {
         configuration.logger.log(.debug, "Sending app-server frame", metadata: ["payload": configuration.logger.render(envelope)])
         try await transport.send(frame: envelope.encoded())
     }
@@ -536,17 +539,24 @@ public actor CodexClient {
     public func respondToServerRequest(id: JSONValue, response: CodexInteractionResponse, generation expectedGeneration: UInt64) async throws {
         guard expectedGeneration == generation else { throw CodexError.staleResponseHandle }
         guard let record = pendingInteractions[id] else { throw CodexError.staleResponseHandle }
-        guard transportInitialized, transport != nil, !intentionallyClosing else { throw CodexError.disconnected }
+        guard transportInitialized, let responseTransport = transport, !intentionallyClosing else { throw CodexError.disconnected }
         // The handle remains one-shot, but the record stays recoverable until the server confirms
         // resolution. If delivery is ambiguous, transport teardown moves it to lostInteractions.
         pendingInteractions[id] = nil
         inFlightInteractions[id] = record
-        switch response {
-        case .error(let code, let message, let data):
-            var error: [String: JSONValue] = ["code": .number(Decimal(code)), "message": .string(message)]
-            if let data { error["data"] = data }
-            try await sendEnvelope(["id": id, "error": .object(error)])
-        default: try await sendEnvelope(["id": id, "result": response.json])
+        do {
+            switch response {
+            case .error(let code, let message, let data):
+                var error: [String: JSONValue] = ["code": .number(Decimal(code)), "message": .string(message)]
+                if let data { error["data"] = data }
+                try await sendEnvelope(["id": id, "error": .object(error)], using: responseTransport)
+            default: try await sendEnvelope(["id": id, "result": response.json], using: responseTransport)
+            }
+        } catch {
+            // Delivery is ambiguous. Closing the exact transport that attempted the response lets
+            // normal reconnect recovery preserve the record without risking a duplicate reply.
+            await responseTransport.close()
+            throw error
         }
     }
 

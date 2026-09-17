@@ -203,6 +203,10 @@ public enum CodexRemoteDiagnosticMode: Sendable, Equatable {
     public static let full: Self = .full(maximumBytes: 1_048_576)
 }
 
+/// An immutable set of validated Remote Control settings.
+///
+/// When migrating from an earlier SDK release, create a new configuration with the throwing
+/// initializer instead of mutating configuration properties in place.
 public struct CodexRemoteConfiguration: Sendable, Equatable {
     public let baseURL: URL
     public let requestTimeout: TimeInterval

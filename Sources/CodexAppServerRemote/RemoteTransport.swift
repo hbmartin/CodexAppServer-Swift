@@ -226,7 +226,7 @@ actor CodexRemoteConnection: CodexTransport {
                     inFlight = nil
                 }
                 if closing {
-                    diagnosticContinuation.yield(.init(level: .warning, message: "Could not send Remote Control close envelope: \(error.localizedDescription)"))
+                    diagnosticContinuation.yield(.init(level: .warning, message: "Could not send queued Remote Control payload before close: \(error.localizedDescription)"))
                 }
                 finish(error)
                 return

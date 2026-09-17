@@ -198,7 +198,7 @@ private actor ProcessJSONLTransport: CodexTransport {
         let diagnostics = AsyncStream<CodexTransportDiagnostic>.makeStream(); self.diagnostics = diagnostics.stream; diagnosticContinuation = diagnostics.continuation
     }
     func start() throws {
-        guard process == nil else { throw CodexError.alreadyConnected }
+        guard process == nil, !finished, !closing else { throw CodexError.alreadyConnected }
         let child = Process(), stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         child.executableURL = executableURL; child.arguments = arguments; child.environment = environment; child.standardInput = stdin; child.standardOutput = stdout; child.standardError = stderr
         do { try child.run() } catch { throw CodexError.transportClosed(error.localizedDescription) }

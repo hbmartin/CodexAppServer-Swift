@@ -126,14 +126,15 @@ else:
         #"""
         #!/usr/bin/python3
         import json, sys
-        json.load(sys.stdin)
         sys.stderr.write("e" * 2000000)
+        sys.stderr.flush()
+        json.load(sys.stdin)
         print(json.dumps({"clientID":"client","sessionToken":"token","requiresDeviceKeyProof":False}))
         """#,
         in: directory
     )
     let helper = try RemoteAuthorizationHelper(path: script.path)
-    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
     #expect(try await helper.authorization(for: credential, forceRefresh: false).clientID == "client")
 }
 
@@ -169,7 +170,6 @@ else:
         #!/usr/bin/python3
         import os, signal, sys, time
         open(\"\(pidFile.path)\", \"w\").write(str(os.getpid()))
-        sys.stdin.read()
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True: time.sleep(1)
         """,
@@ -177,7 +177,7 @@ else:
     )
     // Leave startup headroom when the full suite is concurrently spawning process transports.
     let helper = try RemoteAuthorizationHelper(path: script.path, timeout: .seconds(2))
-    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
     await #expect(throws: CodexRemoteError.self) {
         _ = try await helper.authorization(for: credential, forceRefresh: false)
     }
@@ -195,14 +195,13 @@ else:
         #!/usr/bin/python3
         import os, signal, sys, time
         open(\"\(pidFile.path)\", \"w\").write(str(os.getpid()))
-        sys.stdin.read()
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True: time.sleep(1)
         """,
         in: directory
     )
     let helper = try RemoteAuthorizationHelper(path: script.path)
-    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
     let task = Task { try await helper.authorization(for: credential, forceRefresh: false) }
     for _ in 0..<500 where !FileManager.default.fileExists(atPath: pidFile.path) {
         try await Task.sleep(for: .milliseconds(2))
@@ -211,6 +210,36 @@ else:
     task.cancel()
     await #expect(throws: CancellationError.self) { try await task.value }
     #expect(Darwin.kill(pid, 0) != 0)
+}
+
+@Test func remoteAuthorizationHelperDoesNotWaitForInheritedOutputDescriptors() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let childPIDFile = directory.appendingPathComponent("inherited-output-pid")
+    let script = try writeAuthorizationHelper(
+        """
+        #!/usr/bin/python3
+        import json, os, signal, sys, time
+        json.load(sys.stdin)
+        child = os.fork()
+        if child == 0:
+            open(\"\(childPIDFile.path)\", \"w\").write(str(os.getpid()))
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            while True: time.sleep(1)
+        print(json.dumps({"clientID":"client","sessionToken":"token","requiresDeviceKeyProof":False}), flush=True)
+        """,
+        in: directory
+    )
+    var childPID: Int32?
+    defer { if let childPID { _ = Darwin.kill(childPID, SIGKILL) } }
+    let helper = try RemoteAuthorizationHelper(path: script.path, timeout: .seconds(2))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init("secret"))
+    #expect(try await helper.authorization(for: credential, forceRefresh: false).clientID == "client")
+    for _ in 0..<500 where !FileManager.default.fileExists(atPath: childPIDFile.path) {
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    childPID = try Int32(String(contentsOf: childPIDFile, encoding: .utf8))!
 }
 
 private func writeAuthorizationHelper(_ source: String, in directory: URL) throws -> URL {

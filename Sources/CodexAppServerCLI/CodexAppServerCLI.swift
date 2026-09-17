@@ -1,8 +1,12 @@
 import ArgumentParser
 import Foundation
 import CodexAppServerKit
-#if os(macOS)
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#if os(macOS)
 import CodexAppServerHost
 import CodexAppServerRemote
 
@@ -143,29 +147,35 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
 
     private func run(action: String, input: JSONValue) async throws -> JSONValue {
         let executableURL = self.executableURL
-        let timeout = self.timeout
         let inputData = try input.encoded()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
         let worker = Task.detached {
             let process = Process()
             let standardInput = Pipe(), standardOutput = Pipe(), standardError = Pipe()
+            let ioShutdown = Pipe()
             process.executableURL = executableURL
             process.arguments = [action]
             process.standardInput = standardInput
             process.standardOutput = standardOutput
             process.standardError = standardError
             try process.run()
-            standardInput.fileHandleForWriting.write(inputData)
-            standardInput.fileHandleForWriting.write(Data([0x0A]))
-            try standardInput.fileHandleForWriting.close()
+            let shutdownReader = ioShutdown.fileHandleForReading
             let outputTask = Task.detached { () -> (data: Data, exceededLimit: Bool) in
                 let handle = standardOutput.fileHandleForReading
                 defer { try? handle.close() }
                 let limit = 1_048_576
                 var data = Data()
-                while data.count <= limit {
+                outputLoop: while data.count <= limit {
                     let count = min(64 * 1_024, limit + 1 - data.count)
-                    guard let chunk = try? handle.read(upToCount: count), !chunk.isEmpty else { break }
-                    data.append(chunk)
+                    do {
+                        switch try readAuthorizationHelperPipe(data: handle, shutdown: shutdownReader, maximumCount: count) {
+                        case .data(let chunk, let shutdownAfterRead):
+                            data.append(chunk)
+                            if shutdownAfterRead { break outputLoop }
+                        case .end, .shutdown: break outputLoop
+                        }
+                    } catch { break }
                 }
                 let exceededLimit = data.count > limit
                 if exceededLimit, process.isRunning {
@@ -178,11 +188,26 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
             let errorTask = Task.detached {
                 let handle = standardError.fileHandleForReading
                 defer { try? handle.close() }
-                while let chunk = try? handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {}
+                errorLoop: while true {
+                    do {
+                        switch try readAuthorizationHelperPipe(data: handle, shutdown: shutdownReader, maximumCount: 64 * 1_024) {
+                        case .data(_, let shutdownAfterRead):
+                            if shutdownAfterRead { break errorLoop }
+                            continue
+                        case .end, .shutdown: break errorLoop
+                        }
+                    } catch { break }
+                }
             }
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
+            var requestData = inputData
+            requestData.append(0x0A)
+            let inputTask = Task.detached {
+                let handle = standardInput.fileHandleForWriting
+                defer { try? handle.close() }
+                try writeAuthorizationHelperPipe(requestData, to: handle, shutdown: shutdownReader)
+            }
             var timedOut = false
+            var cancelled = false
             do {
                 while process.isRunning {
                     try Task.checkCancellation()
@@ -190,21 +215,25 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
                     try await Task.sleep(for: .milliseconds(10))
                 }
             } catch is CancellationError {
-                await terminateAuthorizationHelper(process)
-                outputTask.cancel(); errorTask.cancel()
-                _ = await outputTask.value; _ = await errorTask.value
-                throw CancellationError()
+                cancelled = true
             }
-            if timedOut { await terminateAuthorizationHelper(process) }
+            if timedOut || cancelled { await terminateAuthorizationHelper(process) }
             else { await Task.detached { process.waitUntilExit() }.value }
+            // Wake every pipe operation before joining it. A descendant may still hold the
+            // inherited descriptors even though the helper process itself has terminated.
+            try? ioShutdown.fileHandleForWriting.close()
             let outputResult = await outputTask.value
             _ = await errorTask.value
+            let inputResult = await inputTask.result
+            try? shutdownReader.close()
+            if cancelled { throw CancellationError() }
             if timedOut {
                 throw CodexRemoteError.authorizationRequired("authorization helper timed out for \(action)")
             }
             guard !outputResult.exceededLimit else {
                 throw CodexRemoteError.malformedResponse("authorization helper output exceeded 1 MiB")
             }
+            if case .failure(let error) = inputResult { throw error }
             guard process.terminationStatus == 0 else {
                 throw CodexRemoteError.authorizationRequired("authorization helper failed for \(action) with status \(process.terminationStatus)")
             }
@@ -212,6 +241,74 @@ struct RemoteAuthorizationHelper: CodexRemoteClientAuthorizationProvider {
             catch { throw CodexRemoteError.malformedResponse("authorization helper returned invalid JSON for \(action)") }
         }
         return try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+    }
+}
+
+private enum AuthorizationHelperPipeRead {
+    case data(Data, shutdownAfterRead: Bool)
+    case end
+    case shutdown
+}
+
+/// Reads one available chunk while allowing a shared shutdown pipe to interrupt inherited
+/// descriptors. Ready payload bytes win over shutdown so final helper output is not truncated.
+private func readAuthorizationHelperPipe(data: FileHandle, shutdown: FileHandle, maximumCount: Int) throws -> AuthorizationHelperPipeRead {
+    var descriptors = [
+        pollfd(fd: data.fileDescriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+        pollfd(fd: shutdown.fileDescriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+    ]
+    while true {
+        let result = descriptors.withUnsafeMutableBufferPointer {
+            Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
+        }
+        if result < 0 {
+            if errno == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let shuttingDown = descriptors[1].revents != 0
+        if descriptors[0].revents != 0 {
+            var bytes = [UInt8](repeating: 0, count: maximumCount)
+            let count = bytes.withUnsafeMutableBytes { Darwin.read(data.fileDescriptor, $0.baseAddress, $0.count) }
+            if count > 0 { return .data(Data(bytes.prefix(count)), shutdownAfterRead: shuttingDown) }
+            if count == 0 { return .end }
+            if errno == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        if shuttingDown { return .shutdown }
+    }
+}
+
+/// Writes without blocking the timeout monitor. The descriptor is nonblocking and poll is woken
+/// through the same shutdown pipe used by the output drainers.
+private func writeAuthorizationHelperPipe(_ data: Data, to handle: FileHandle, shutdown: FileHandle) throws {
+    let descriptor = handle.fileDescriptor
+    let flags = Darwin.fcntl(descriptor, F_GETFL)
+    guard flags >= 0, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    _ = Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1)
+    try data.withUnsafeBytes { bytes in
+        guard let baseAddress = bytes.baseAddress else { return }
+        var offset = 0
+        while offset < bytes.count {
+            var descriptors = [
+                pollfd(fd: descriptor, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0),
+                pollfd(fd: shutdown.fileDescriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+            ]
+            let result = descriptors.withUnsafeMutableBufferPointer {
+                Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
+            }
+            if result < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if descriptors[1].revents != 0 { return }
+            guard descriptors[0].revents != 0 else { continue }
+            let count = Darwin.write(descriptor, baseAddress.advanced(by: offset), bytes.count - offset)
+            if count > 0 { offset += count; continue }
+            if count < 0, errno == EINTR || errno == EAGAIN { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 
@@ -504,6 +601,9 @@ private func selectRemoteHost(controller: CodexRemoteController, requested: Stri
 #else
 @main
 private enum CodexAppServerCLIUnsupportedPlatform {
-    static func main() {}
+    static func main() {
+        FileHandle.standardError.write(Data("codex-app-server-cli is unsupported on this platform.\n".utf8))
+        exit(EXIT_FAILURE)
+    }
 }
 #endif

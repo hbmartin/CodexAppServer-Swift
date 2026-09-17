@@ -49,12 +49,13 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     defer { try? FileManager.default.removeItem(at: directory) }
     let port = try availableLoopbackPort()
     let report = directory.appendingPathComponent("report.json")
+    let finalSendObserved = directory.appendingPathComponent("final-send-observed")
     let script = directory.appendingPathComponent("remote-ws.py")
     try remoteWebSocketServerSource.write(to: script, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     let process = Process()
     process.executableURL = script
-    process.arguments = [String(port), report.path]
+    process.arguments = [String(port), report.path, finalSendObserved.path]
     process.standardOutput = FileHandle.nullDevice
     process.standardError = FileHandle.nullDevice
     try process.run()
@@ -101,16 +102,14 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
     let finalSend = Task {
         try await second.send(frame: try JSONValue.object(["client": 4, "blob": .string(String(repeating: "z", count: 2_000))]).encoded())
     }
-    try await Task.sleep(for: .milliseconds(10))
+    try await waitForFile(finalSendObserved, timeout: .seconds(5))
     let concurrentClose = Task { await second.close() }
     let secondClose = Task { await second.close() }
     try await finalSend.value
     await concurrentClose.value
     await secondClose.value
 
-    for _ in 0..<500 where !FileManager.default.fileExists(atPath: report.path) {
-        try await Task.sleep(for: .milliseconds(10))
-    }
+    try await waitForFile(report, timeout: .seconds(5))
     let raw = try JSONValue.decode(Data(contentsOf: report))
     #expect(raw["outbound_sequences"] == [1, 2, 1])
     #expect(raw["outbound_payloads"]?[0] == ["client": 1])
@@ -143,6 +142,9 @@ private struct ChallengedLoopbackAuthorization: CodexRemoteClientAuthorizationPr
         #expect(streamFrames.last?["type"] == "client_closed")
         let closeSequence = try #require(streamFrames.last?["seq_id"]?.intValue)
         #expect(streamFrames.dropLast().allSatisfy { ($0["seq_id"]?.intValue ?? closeSequence) < closeSequence })
+        if streamID == streamIDs[1] {
+            #expect(streamFrames.dropLast().contains { $0["seq_id"]?.intValue == 2 })
+        }
     }
 }
 
@@ -278,12 +280,24 @@ private func waitForLoopbackListener(port: Int) async throws {
     throw CodexError.transportClosed("test WebSocket server did not listen")
 }
 
+private func waitForFile(_ url: URL, timeout: Duration) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !FileManager.default.fileExists(atPath: url.path), clock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw CodexError.transportClosed("test fixture did not create \(url.lastPathComponent)")
+    }
+}
+
 private let remoteWebSocketServerSource = #"""
 #!/usr/bin/python3
 import base64, hashlib, json, os, socket, struct, sys, tempfile
 
 port = int(sys.argv[1])
 report_path = sys.argv[2]
+final_send_path = sys.argv[3]
 report = {"outbound_sequences": [], "outbound_payloads": [], "chunk_counts": [], "wire_frame_sizes": [], "wire_frames": [], "authorization": [], "account_ids": [], "session_tokens": [], "client_ids": [], "protocol_versions": [], "paths": [], "stream_ids": []}
 
 def recv_exact(connection, count):
@@ -402,6 +416,8 @@ for connection_index in range(2):
     try:
         while True:
             frame = receive_text(connection)
+            if connection_index == 1 and frame is not None and frame.get("seq_id") == 2 and not os.path.exists(final_send_path):
+                open(final_send_path, "w").close()
             if frame is None or frame.get("type") == "client_closed": break
     except Exception:
         pass

@@ -121,6 +121,31 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     #expect(clock.now - started < .seconds(2))
 }
 
+@Test func processTransportCannotRestartAfterClose() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = directory.appendingPathComponent("single-start.py")
+    let launches = directory.appendingPathComponent("launches")
+    let source = """
+    #!/usr/bin/python3
+    import time
+    with open(\"\(launches.path)\", \"a\") as output:
+        output.write("started\\n")
+        output.flush()
+    while True: time.sleep(1)
+    """
+    try source.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+    let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
+    try await transport.start()
+    try await waitForForwardFile(launches)
+    await transport.close()
+    await #expect(throws: CodexError.alreadyConnected) { try await transport.start() }
+    let launchCount = try String(contentsOf: launches, encoding: .utf8).split(separator: "\n").count
+    #expect(launchCount == 1)
+}
+
 @Test(.enabled(if: ProcessInfo.processInfo.environment["RUN_CODEX_PROCESS_TESTS"] == "1"))
 func reviewSSHForwardWaitsForListenerReadiness() async throws {
     let executable = try CodexCLIResolver().resolve()
