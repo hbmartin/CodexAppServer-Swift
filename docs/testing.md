@@ -77,7 +77,14 @@ The local release smoke test uses isolated stdio, starts an ephemeral task with 
 CODEX_LUNA_MODEL=gpt-5.6-luna Scripts/run-authenticated-luna-tests.sh
 ```
 
-The model name must contain `luna`; the test refuses other models. The older two-client managed-daemon test remains available with `RUN_CODEX_MANAGED_TESTS=1 swift test --filter authenticatedLunaTwoClientSharedTask` for CLI versions whose proxy accepts newline JSON. It is not part of the release smoke test because the local check with CLI 0.157.0 found that transport incompatible.
+The model name must contain `luna`; the test refuses other models. The older two-client managed-daemon test remains available for CLI versions whose proxy accepts newline JSON:
+
+```sh
+CODEX_LUNA_MODEL=gpt-5.6-luna RUN_CODEX_MANAGED_TESTS=1 \
+  swift test --filter authenticatedLunaTwoClientSharedTask
+```
+
+It is not part of the release smoke test because the local check with CLI 0.157.0 found that transport incompatible.
 
 ## Authenticated production Remote Control test
 

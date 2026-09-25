@@ -91,43 +91,161 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
 }
 
 @Test func processTransportCloseWakesReadersWhenADescendantKeepsPipesOpen() async throws {
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let script = directory.appendingPathComponent("inherited-pipes.py")
-    let childPIDFile = directory.appendingPathComponent("child-pid")
-    let source = """
-    #!/usr/bin/python3
-    import os, signal, time
-    child = os.fork()
-    if child == 0:
-        open(\"\(childPIDFile.path)\", \"w\").write(str(os.getpid()))
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        while True: time.sleep(1)
-    while True: time.sleep(1)
-    """
-    try source.write(to: script, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
-    let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
-    try await transport.start()
-    let startupDeadline = ContinuousClock.now + .seconds(5)
-    var childPID: Int32?
-    while ContinuousClock.now < startupDeadline {
-        if let value = try? String(contentsOf: childPIDFile, encoding: .utf8),
-           let pid = Int32(value) { childPID = pid; break }
-        try await Task.sleep(for: .milliseconds(10))
+    let fixture = try await InheritedPipeFixture()
+    try await fixture.run { fixture in
+        let processes = try await fixture.waitForReadiness()
+        #expect(Darwin.kill(processes.child, 0) == 0)
+        let started = ContinuousClock.now
+        await fixture.transport.close()
+        // The descendant must still hold the pipes open throughout the measured close.
+        #expect(ContinuousClock.now - started < .seconds(4))
+        #expect(Darwin.kill(processes.child, 0) == 0)
     }
-    guard let childPID else {
-        await transport.close()
-        Issue.record("the inherited-pipe child did not start before the deadline")
-        return
+}
+
+@Test func processTransportReadinessTimeoutCleansUpInheritedPipeFixture() async throws {
+    let fixture = try await InheritedPipeFixture(publishesReadiness: false)
+    await #expect(throws: InheritedPipeFixture.Failure.timedOut("ready")) {
+        try await fixture.run { fixture in
+            // Establish that a real descendant exists before exercising unavailable readiness.
+            let processes = try await fixture.waitForDiagnosticPIDs()
+            #expect(Darwin.kill(processes.child, 0) == 0)
+            _ = try await fixture.waitForReadiness(timeout: .milliseconds(100))
+        }
     }
-    defer { _ = Darwin.kill(childPID, SIGKILL) }
-    let clock = ContinuousClock()
-    let started = clock.now
-    await transport.close()
-    // Leave scheduling headroom when the whole Swift Testing suite runs in parallel.
-    #expect(clock.now - started < .seconds(4))
+    #expect(!FileManager.default.fileExists(atPath: fixture.directory.path))
+}
+
+@Test func processTransportCancellationCleansUpInheritedPipeFixture() async throws {
+    let fixture = try await InheritedPipeFixture(publishesReadiness: false)
+    let task = Task {
+        try await fixture.run { fixture in
+            _ = try await fixture.waitForReadiness(timeout: .seconds(30))
+        }
+    }
+    do {
+        let processes = try await fixture.waitForDiagnosticPIDs()
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(processes.running.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.directory.path))
+    } catch {
+        task.cancel()
+        _ = await task.result
+        throw error
+    }
+}
+
+private struct InheritedPipeFixture: Sendable {
+    enum Failure: Error, Equatable {
+        case timedOut(String)
+        case processesDidNotExit([Int32])
+    }
+
+    struct ProcessIDs: Decodable, Sendable {
+        let parent: Int32
+        let child: Int32
+        var running: [Int32] { [parent, child].filter { Darwin.kill($0, 0) == 0 } }
+    }
+
+    let directory: URL
+    let transport: any CodexTransport
+    private let lifetime: URL
+    private let readiness: URL
+    private let diagnosticPIDs: URL
+
+    init(publishesReadiness: Bool = true) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        self.directory = directory
+        lifetime = directory.appendingPathComponent("lifetime")
+        readiness = directory.appendingPathComponent("ready")
+        diagnosticPIDs = directory.appendingPathComponent("processes.json")
+        do {
+            try Data().write(to: lifetime)
+            let script = directory.appendingPathComponent("inherited-pipes.py")
+            let source = """
+            #!/usr/bin/python3
+            import json, os, pathlib, signal, time
+            directory = pathlib.Path(__file__).parent
+            parent = os.getpid()
+            child = os.fork()
+            if child == 0:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                processes = json.dumps({"parent": parent, "child": os.getpid()})
+                (directory / "processes.json").write_text(processes)
+                if \(publishesReadiness ? "True" : "False"):
+                    (directory / "ready").write_text(processes)
+                while (directory / "lifetime").exists(): time.sleep(0.01)
+                os._exit(0)
+            while True: time.sleep(1)
+            """
+            try source.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+            transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    func run(_ operation: @Sendable (Self) async throws -> Void) async throws {
+        // Removing the directory is also a fallback for the lifetime marker on every exit.
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result: Result<Void, Error>
+        do {
+            try await transport.start()
+            try await operation(self)
+            result = .success(())
+        } catch {
+            result = .failure(error)
+        }
+        do { try await cleanUp() }
+        catch { Issue.record(error) }
+        try result.get()
+    }
+
+    func waitForReadiness(timeout: Duration = .seconds(5)) async throws -> ProcessIDs {
+        try await waitForPIDs(at: readiness, timeout: timeout)
+    }
+
+    func waitForDiagnosticPIDs() async throws -> ProcessIDs {
+        try await waitForPIDs(at: diagnosticPIDs, timeout: .seconds(5))
+    }
+
+    private func readPIDs(at url: URL) -> ProcessIDs? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(ProcessIDs.self, from: data)
+    }
+
+    private func waitForPIDs(at url: URL, timeout: Duration) async throws -> ProcessIDs {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            if let processes = readPIDs(at: url) { return processes }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw Failure.timedOut(url.lastPathComponent)
+    }
+
+    private func cleanUp() async throws {
+        // A detached task does not inherit cancellation from the test's readiness wait.
+        try await Task.detached {
+            let removal = Result { try FileManager.default.removeItem(at: lifetime) }
+            await transport.close()
+            try removal.get()
+            // PID reporting verifies cleanup; removing the marker stops the child even when
+            // startup never supplied a PID or readiness record to the test.
+            if let processes = readPIDs(at: diagnosticPIDs) {
+                let deadline = ContinuousClock.now + .seconds(5)
+                while !processes.running.isEmpty, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let running = processes.running
+                guard running.isEmpty else { throw Failure.processesDidNotExit(running) }
+            }
+        }.value
+    }
 }
 
 @Test func processTransportCannotRestartAfterClose() async throws {
