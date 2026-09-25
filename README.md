@@ -52,6 +52,8 @@ try await clientB.connect()
 
 `prepareManagedDaemon()` is the only API that bootstraps durable management. A managed connection starts an existing daemon when needed. Disconnecting a client never stops it. Lifecycle APIs include status, ensure-running, start, stop, restart, CLI version, and daemon version.
 
+Compatibility note: with Codex CLI 0.157.0, the managed control socket and `codex app-server proxy` carry WebSocket traffic, while this SDK's `managedDaemon` and `sshProxy` adapters send newline JSON. In a live check, initialization through those adapters did not complete. For a Mac-to-Mac connection, use the verified [`sshForward` setup](docs/tailscale-ssh-macos.md); the managed adapters need a WebSocket transport update before use with this CLI version.
+
 The client does not queue input while offline. Calls made while disconnected or reconnecting fail. It reconnects up to three times with jittered exponential delay capped at 30 seconds, reinitializes, resumes requested tasks, and refetches authoritative history. After exhaustion, the same client and task intents remain available to `reconnect()`.
 
 If a question or approval was pending at disconnect and Codex does not replay it, state becomes `recoveryRequired`; the SDK never guesses, interrupts, approves, declines, or acts on `autoResolutionMs` locally.
@@ -130,6 +132,8 @@ Supported deployments are (a) the Unix daemon behind a caller-managed authentica
 
 System SSH always uses `BatchMode=yes` and normal known-host enforcement. Pass an existing host alias or structured hostname/user/port/identity settings. Only a conservative allowlist of extra OpenSSH options is accepted. SSH forwarding requires OpenSSH 8.7 or newer, or a compatible client that supports `ForkAfterAuthentication`.
 
+Deployment walkthroughs: [Mac-to-Mac over Tailscale and SSH](docs/tailscale-ssh-macos.md) and [a personal iOS app over Tailscale Serve and WSS](docs/tailscale-serve-ios.md).
+
 ## Remote Control
 
 `CodexAppServerRemote` lists Remote Control environments, claims manual pairing codes for an enrolled controller, and creates protocol-v3 app-server transports. The transport validates the service's device-key challenge before sending app traffic, segments large messages, bounds send backpressure, and diagnoses duplicate or gapped stream sequences.
@@ -163,8 +167,7 @@ codex-app-server-cli daemon prepare
 codex-app-server-cli daemon status --json
 codex-app-server-cli connect isolated
 codex-app-server-cli connect daemon --notify-config ./codex-notifications.json
-codex-app-server-cli connect ssh-proxy my-host-alias
-codex-app-server-cli connect ssh-forward my-host --local-port 4501 --remote-port 4500
+codex-app-server-cli connect ssh-forward my-host --local-port 4501 --remote-port 4500 --app-bearer-env CODEX_APP_BEARER
 codex-app-server-cli connect wss wss://codex.example.com \
   --app-bearer-env CODEX_APP_BEARER \
   --tunnel-header CF-Access-Client-Secret \
