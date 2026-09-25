@@ -472,6 +472,11 @@ func coalescingFailsInsteadOfLosingIncompatibleEvents(scenario: String) async th
     let client = CodexClient(transportFactory: .init { transport }, configuration: .init(requestTimeout: .seconds(2)))
     await client.setInteractionHandler { _ in .answers([:]) }
     _ = try await client.connect()
+    let deadline = ContinuousClock.now + .seconds(2)
+    while ContinuousClock.now < deadline {
+        if await transport.messages().contains(where: { $0["id"] == 56 && $0["result"] != nil }) { break }
+        try await Task.sleep(for: .milliseconds(2))
+    }
     #expect(await transport.messages().contains { $0["id"] == 56 && $0["result"] != nil })
     await client.close()
 }

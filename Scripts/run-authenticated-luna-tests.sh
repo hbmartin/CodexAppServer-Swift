@@ -6,4 +6,4 @@ if [[ "${CODEX_LUNA_MODEL:-}" != *luna* ]]; then
   exit 2
 fi
 
-RUN_CODEX_LIVE_TESTS=1 swift test --filter authenticatedLuna
+RUN_CODEX_LIVE_TESTS=1 swift test -Xswiftc -strict-concurrency=complete --no-parallel --filter authenticatedLunaIsolatedTurnCompletes

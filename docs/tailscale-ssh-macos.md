@@ -24,9 +24,13 @@ The macOS App Store and Standalone Tailscale apps cannot act as **Tailscale SSH 
 4. Install and authenticate a Codex CLI on the Mac mini. The [official standalone installer](https://learn.chatgpt.com/docs/codex/cli) provides a complete package and places `codex` in `~/.local/bin`:
 
    ```sh
-   curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh
-   sh /tmp/codex-install.sh
-   "$HOME/.local/bin/codex" --version
+   (
+     installer="$(mktemp "${TMPDIR:-/tmp}/codex-install.XXXXXXXX")" || exit 1
+     trap 'rm -f "$installer"' EXIT
+     curl -fsSL https://chatgpt.com/codex/install.sh -o "$installer" || exit 1
+     sh "$installer"
+   ) &&
+   "$HOME/.local/bin/codex" --version &&
    "$HOME/.local/bin/codex" login status
    ```
 
@@ -55,6 +59,7 @@ On the **MacBook**, use an existing Ed25519 key or create one. Keep the private 
 
 ```sh
 test -f ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+ssh-add ~/.ssh/id_ed25519
 cat ~/.ssh/id_ed25519.pub
 ```
 
@@ -97,7 +102,7 @@ ssh -o BatchMode=no codex-mini true # First connection: compare and accept the h
 ssh codex-mini 'whoami; nc -G 3 -z 127.0.0.1 4500'
 ```
 
-Accept the host key only after comparing the fingerprint above. Afterward, `BatchMode=yes` must allow connections without a password prompt. If authentication fails, check the public key, permissions of `~/.ssh` and `authorized_keys`, the `User` setting, and the Remote Login allowlist. The SSH-forward transport itself does not run a remote `codex` command.
+Accept the host key only after comparing the fingerprint above. `ssh-add` loads a passphrase-protected key into the agent so the later `BatchMode=yes` connection can use it without a prompt; load it again if the agent loses the key. If authentication fails, check the public key, permissions of `~/.ssh` and `authorized_keys`, the `User` setting, and the Remote Login allowlist. The SSH-forward transport itself does not run a remote `codex` command.
 
 ## 4. Connect this SDK
 
@@ -150,7 +155,7 @@ The app supplies its own secret store. The transport establishes SSH with `Batch
 
 ### Why this guide uses `ssh-forward`
 
-The repository also exposes `ssh-proxy`, which sends newline JSON to `codex app-server proxy`. Current Codex's managed control socket uses a WebSocket stream, and a local check with Codex CLI 0.157.0 showed that this JSON transport never received an `initialize` response. Use the verified SSH-forward path for this setup; `daemon version` alone does not prove that `ssh-proxy` works. The [Codex app-server transport documentation](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md) describes the Unix-socket WebSocket protocol.
+The repository also exposes `ssh-proxy`, which sends newline JSON to `codex app-server proxy`. A local check with Codex CLI 0.157.0 found that its managed control socket carried a WebSocket stream and this JSON transport never received an `initialize` response. Use the verified SSH-forward path for this setup; `daemon version` alone does not prove that `ssh-proxy` works.
 
 ## Restrict access and troubleshoot
 

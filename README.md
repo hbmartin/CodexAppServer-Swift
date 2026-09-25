@@ -38,7 +38,9 @@ Coalescing preserves adjacent text fragments for the same item and segment. Inco
 
 ## Lifecycle and durable local tasks
 
-Isolated stdio intentionally creates an independent app-server. To let multiple controllers—including your app on another Mac—share live turns and approvals, bootstrap and reuse one managed daemon:
+Isolated stdio intentionally creates an independent app-server. **Compatibility note:** a local check with Codex CLI 0.157.0 found that its managed control socket and `codex app-server proxy` carry WebSocket traffic, while this SDK's `managedDaemon` and `sshProxy` adapters send newline JSON. Initialization through those adapters did not complete. For a Mac-to-Mac connection with that CLI version, use the verified [`sshForward` setup](docs/tailscale-ssh-macos.md).
+
+The following managed-daemon example illustrates the SDK API for a compatible proxy. **It does not work with Codex CLI 0.157.0**; that version needs a WebSocket transport update before these adapters can be used:
 
 ```swift
 let daemon = CodexDaemonController(executableURL: executable)
@@ -51,8 +53,6 @@ try await clientB.connect()
 ```
 
 `prepareManagedDaemon()` is the only API that bootstraps durable management. A managed connection starts an existing daemon when needed. Disconnecting a client never stops it. Lifecycle APIs include status, ensure-running, start, stop, restart, CLI version, and daemon version.
-
-Compatibility note: with Codex CLI 0.157.0, the managed control socket and `codex app-server proxy` carry WebSocket traffic, while this SDK's `managedDaemon` and `sshProxy` adapters send newline JSON. In a live check, initialization through those adapters did not complete. For a Mac-to-Mac connection, use the verified [`sshForward` setup](docs/tailscale-ssh-macos.md); the managed adapters need a WebSocket transport update before use with this CLI version.
 
 The client does not queue input while offline. Calls made while disconnected or reconnecting fail. It reconnects up to three times with jittered exponential delay capped at 30 seconds, reinitializes, resumes requested tasks, and refetches authoritative history. After exhaustion, the same client and task intents remain available to `reconnect()`.
 
@@ -233,10 +233,10 @@ The reviewed CLI 0.146.0 snapshot is in `Schemas/0.146.0`. CI regenerates it wit
 
 `Scripts/check-sdk-schema-conformance.sh` checks the SDK against the pinned snapshot: every method the SDK sends must exist in `ClientRequest.json`, every notification method it routes must exist in `ServerNotification.json`, and `CodexItemKind` must still match the `ThreadItem` discriminator. An SDK case absent from the snapshot warns; a snapshot case missing from the SDK fails. Drift against a newer upstream schema is checked separately by `check-schema-drift.sh`.
 
-Authenticated local tests are opt-in. Any test that starts a model turn must set an explicit Luna model and fails closed otherwise:
+Authenticated local tests are opt-in. The release smoke test starts an ephemeral isolated-stdio turn, requires its completed response, and fails closed without an explicit Luna model:
 
 ```sh
-RUN_CODEX_LIVE_TESTS=1 CODEX_LUNA_MODEL=gpt-5.6-luna swift test --filter authenticatedLuna
+CODEX_LUNA_MODEL=gpt-5.6-luna Scripts/run-authenticated-luna-tests.sh
 ```
 
 The Remote Control smoke test starts an isolated production host and verifies that the SDK discovers that exact environment as online. Pairing, segmentation, and device-key proof are covered by real loopback WebSocket tests; production pairing requires an embedding application's step-up enrollment and protected signer.
