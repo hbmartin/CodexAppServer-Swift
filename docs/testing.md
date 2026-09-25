@@ -71,13 +71,13 @@ They require `codex` 0.146.0 or newer on `PATH`. They cover a real isolated file
 
 ## Authenticated local Luna test
 
-The local release smoke test uses two clients connected to one managed daemon and verifies that the second client sees the first client's turn:
+The local release smoke test uses isolated stdio, starts an ephemeral task with an explicit Luna model, and requires a completed turn containing the expected response:
 
 ```sh
 CODEX_LUNA_MODEL=gpt-5.6-luna Scripts/run-authenticated-luna-tests.sh
 ```
 
-The model name must contain `luna`; the test refuses other models. This path bootstraps or starts managed daemon support and creates a persistent Codex task.
+The model name must contain `luna`; the test refuses other models. The older two-client managed-daemon test remains available with `RUN_CODEX_MANAGED_TESTS=1 swift test --filter authenticatedLunaTwoClientSharedTask` for CLI versions whose proxy accepts newline JSON. It is not part of the release smoke test because the local check with CLI 0.157.0 found that transport incompatible.
 
 ## Authenticated production Remote Control test
 

@@ -84,6 +84,9 @@ private actor CleanupTrackingTransport: CodexTransport {
     #expect(await transport.isClosed())
 }
 
+// Pipe tests use blocking poll calls; run them one at a time so the suite's
+// concurrent process tests cannot exhaust Swift's cooperative executor.
+@Suite(.serialized) private struct AuthorizationHelperTests {
 @Test func remoteAuthorizationHelperUsesStdinJSONForAuthorizationAndChallengeProof() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -185,6 +188,35 @@ else:
     }
 }
 
+@Test func remoteAuthorizationHelperRejectsIncompleteWriteAfterSuccessfulExit() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let childPIDFile = directory.appendingPathComponent("inherited-input-pid")
+    defer {
+        if let contents = try? String(contentsOf: childPIDFile, encoding: .utf8),
+           let pid = Int32(contents) { _ = Darwin.kill(pid, SIGKILL) }
+    }
+    let script = try writeAuthorizationHelper(
+        """
+        #!/usr/bin/python3
+        import json, os, signal, time
+        child = os.fork()
+        if child == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            while True: time.sleep(1)
+        open(\"\(childPIDFile.path)\", \"w\").write(str(child))
+        print(json.dumps({"clientID":"client","sessionToken":"token","requiresDeviceKeyProof":False}), flush=True)
+        """,
+        in: directory
+    )
+    let helper = try RemoteAuthorizationHelper(path: script.path, timeout: .seconds(5))
+    let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
+    await #expect(throws: CodexRemoteError.authorizationRequired("authorization helper request was not fully written")) {
+        _ = try await helper.authorization(for: credential, forceRefresh: false)
+    }
+}
+
 @Test func remoteAuthorizationHelperRejectsOversizedStdout() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -225,7 +257,7 @@ else:
     // Leave startup headroom when the full suite is concurrently spawning process transports.
     let helper = try RemoteAuthorizationHelper(path: script.path, timeout: .seconds(2))
     let credential = try CodexRemoteCredential(accountID: "account", accessToken: .init(String(repeating: "s", count: 2_000_000)))
-    await #expect(throws: CodexRemoteError.self) {
+    await #expect(throws: CodexRemoteError.authorizationRequired("authorization helper timed out for authorize")) {
         _ = try await helper.authorization(for: credential, forceRefresh: false)
     }
     let pid = try Int32(String(contentsOf: pidFile, encoding: .utf8))!
@@ -287,6 +319,7 @@ else:
         try await Task.sleep(for: .milliseconds(2))
     }
     childPID = try Int32(String(contentsOf: childPIDFile, encoding: .utf8))!
+}
 }
 
 private func writeAuthorizationHelper(_ source: String, in directory: URL) throws -> URL {

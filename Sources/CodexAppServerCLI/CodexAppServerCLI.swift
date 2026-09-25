@@ -302,7 +302,9 @@ private func writeAuthorizationHelperPipe(_ data: Data, to handle: FileHandle, s
                 if errno == EINTR { continue }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if descriptors[1].revents != 0 { return }
+            if descriptors[1].revents != 0 {
+                throw CodexRemoteError.authorizationRequired("authorization helper request was not fully written")
+            }
             guard descriptors[0].revents != 0 else { continue }
             let count = Darwin.write(descriptor, baseAddress.advanced(by: offset), bytes.count - offset)
             if count > 0 { offset += count; continue }

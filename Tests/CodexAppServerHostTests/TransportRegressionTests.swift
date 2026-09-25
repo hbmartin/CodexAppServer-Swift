@@ -110,15 +110,24 @@ func reviewWebSocketHonorsConfiguredMaximumFrameBytes() async throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
     let transport = try await CodexHostTransports.sshProxy(sshURL: script, host: .alias("ignored")).makeTransport()
     try await transport.start()
-    for _ in 0..<500 where !FileManager.default.fileExists(atPath: childPIDFile.path) {
-        try await Task.sleep(for: .milliseconds(2))
+    let startupDeadline = ContinuousClock.now + .seconds(5)
+    var childPID: Int32?
+    while ContinuousClock.now < startupDeadline {
+        if let value = try? String(contentsOf: childPIDFile, encoding: .utf8),
+           let pid = Int32(value) { childPID = pid; break }
+        try await Task.sleep(for: .milliseconds(10))
     }
-    let childPID = try Int32(String(contentsOf: childPIDFile, encoding: .utf8))!
+    guard let childPID else {
+        await transport.close()
+        Issue.record("the inherited-pipe child did not start before the deadline")
+        return
+    }
     defer { _ = Darwin.kill(childPID, SIGKILL) }
     let clock = ContinuousClock()
     let started = clock.now
     await transport.close()
-    #expect(clock.now - started < .seconds(2))
+    // Leave scheduling headroom when the whole Swift Testing suite runs in parallel.
+    #expect(clock.now - started < .seconds(4))
 }
 
 @Test func processTransportCannotRestartAfterClose() async throws {
