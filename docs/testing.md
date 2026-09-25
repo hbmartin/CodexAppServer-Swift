@@ -84,7 +84,7 @@ CODEX_LUNA_MODEL=gpt-5.6-luna RUN_CODEX_MANAGED_TESTS=1 \
   swift test --filter authenticatedLunaTwoClientSharedTask
 ```
 
-It is not part of the release smoke test because the local check with CLI 0.157.0 found that transport incompatible.
+This test bootstraps durable managed daemon support and creates a persistent thread. Closing its clients does not stop the daemon or remove the thread. It is not part of the release smoke test because the local check with CLI 0.157.0 found that this transport was incompatible.
 
 ## Authenticated production Remote Control test
 
