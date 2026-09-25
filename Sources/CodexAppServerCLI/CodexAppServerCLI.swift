@@ -280,7 +280,7 @@ private func readAuthorizationHelperPipe(data: FileHandle, shutdown: FileHandle,
 
 /// Writes without blocking the timeout monitor. The descriptor is nonblocking and poll is woken
 /// through the same shutdown pipe used by the output drainers.
-private func writeAuthorizationHelperPipe(_ data: Data, to handle: FileHandle, shutdown: FileHandle) throws {
+func writeAuthorizationHelperPipe(_ data: Data, to handle: FileHandle, shutdown: FileHandle) throws {
     let descriptor = handle.fileDescriptor
     let flags = Darwin.fcntl(descriptor, F_GETFL)
     guard flags >= 0, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
@@ -302,7 +302,9 @@ private func writeAuthorizationHelperPipe(_ data: Data, to handle: FileHandle, s
                 if errno == EINTR { continue }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            if descriptors[1].revents != 0 {
+            // Let a ready pipe failure reach write() so simultaneous shutdown preserves EPIPE.
+            let inputFailed = descriptors[0].revents & Int16(POLLHUP | POLLERR) != 0
+            if descriptors[1].revents != 0, !inputFailed {
                 throw CodexRemoteError.authorizationRequired("authorization helper request was not fully written")
             }
             guard descriptors[0].revents != 0 else { continue }

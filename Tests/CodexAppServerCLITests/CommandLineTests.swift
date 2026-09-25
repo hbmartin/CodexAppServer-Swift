@@ -84,9 +84,39 @@ private actor CleanupTrackingTransport: CodexTransport {
     #expect(await transport.isClosed())
 }
 
-// Pipe tests use blocking poll calls; run them one at a time so the suite's
-// concurrent process tests cannot exhaust Swift's cooperative executor.
+// Serialize these helper tests to reduce concurrent blocking pipe operations.
+// Other test suites may still run concurrently.
 @Suite(.serialized) private struct AuthorizationHelperTests {
+@Test(arguments: [false, true])
+func authorizationHelperWriterPreservesBrokenPipeRegardlessOfShutdown(shutdownReady: Bool) throws {
+    let input = Pipe(), shutdown = Pipe()
+    defer {
+        for handle in [input.fileHandleForReading, input.fileHandleForWriting,
+                       shutdown.fileHandleForReading, shutdown.fileHandleForWriting] {
+            try? handle.close()
+        }
+    }
+    try input.fileHandleForReading.close()
+    if shutdownReady { try shutdown.fileHandleForWriting.close() }
+    #expect(throws: POSIXError(.EPIPE)) {
+        try writeAuthorizationHelperPipe(Data("request\n".utf8), to: input.fileHandleForWriting, shutdown: shutdown.fileHandleForReading)
+    }
+}
+
+@Test func authorizationHelperWriterRejectsShutdownEvenWhenInputIsWritable() throws {
+    let input = Pipe(), shutdown = Pipe()
+    defer {
+        for handle in [input.fileHandleForReading, input.fileHandleForWriting,
+                       shutdown.fileHandleForReading, shutdown.fileHandleForWriting] {
+            try? handle.close()
+        }
+    }
+    try shutdown.fileHandleForWriting.close()
+    #expect(throws: CodexRemoteError.authorizationRequired("authorization helper request was not fully written")) {
+        try writeAuthorizationHelperPipe(Data("request\n".utf8), to: input.fileHandleForWriting, shutdown: shutdown.fileHandleForReading)
+    }
+}
+
 @Test func remoteAuthorizationHelperUsesStdinJSONForAuthorizationAndChallengeProof() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
